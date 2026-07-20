@@ -4,7 +4,7 @@
 
 计划的主线是合理的：先冻结单节点不可变对象与 root 可见性，再建设故障模拟、复制、控制面、EC 和客户端集成。但当前计划过早把多个尚未冻结的语义绑定在一起，不能直接作为十个连续 coding 批次执行。
 
-当前仓库已有 `cairn-core`、`cairn-device`、`cairn-ec`、`cairn-sim` 和空的 `cairn-model`；尚无真实 `FileDevice`、控制面、placement 或复制实现。因此下一步仍应先完成单节点 Gate 1 和进程内模拟 gate，而不是铺开真实集群 crate。
+当前仓库已有 `cairn-core`、`cairn-device`、`cairn-ec`、`cairn-sim` 以及纯内存差分参考模型 `cairn-model`；尚无真实 `FileDevice`、控制面、placement 或复制实现。因此下一步仍应先完成单节点 Gate 1 和进程内模拟 gate，而不是铺开真实集群 crate。
 
 ## 已确认的数学错误
 

@@ -50,6 +50,11 @@ dependencies = [
 [[package]]
 name = "cairn-model"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cairn-core",
+ "cairn-device",
+]
 
 [[package]]
 name = "cairn-sim"
