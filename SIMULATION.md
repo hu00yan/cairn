@@ -41,17 +41,20 @@ The first implementation now provides these deterministic primitives:
   error;
 - `cairn-ec`: checksum-bound `ShardBuffer` inputs exclude corrupted shards and
   `reconstruct_all` returns a repaired complete stripe;
-- both components expose operation/time state sufficient to reproduce a test
-  without wall-clock sleeps or real devices.
+- both components expose operation/time state and the network trace records
+  the inputs that affect delivery (payload, epochs, policy, delivery time,
+  fault boundaries, and virtual-time advances), sufficient to reproduce the
+  current bounded tests without wall-clock sleeps or real devices;
+- the trace is an input record, not yet a standalone generic replay runner.
 
 `SimDisk` fault operation numbers intentionally cover state-changing writes and
 flushes only; reads use persistent range faults because `BlockDevice::read_at`
 is observational and takes `&self`. A future concurrent-reader seam may add a
 separate read event stream without changing durability operation numbering.
 
-The next simulator-only additions are property/state-machine generators and a
-small replay record. They must stay on these in-memory seams before the storage
-core starts depending on them.
+The next simulator-only additions are broader property/state-machine
+generators and a standalone replay runner. They must stay on these in-memory
+seams before the storage core starts depending on them.
 
 ## Fault dimensions
 

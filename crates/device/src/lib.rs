@@ -96,9 +96,9 @@ pub enum Fault {
 
 #[derive(Clone, Debug)]
 struct PendingWrite {
+    operation_id: u64,
     offset: u64,
     data: Vec<u8>,
-    issued_at: u64,
     tear_prefix: Option<usize>,
 }
 
@@ -110,8 +110,8 @@ pub struct SimDisk {
     pub config: SimConfig,
     op_index: u64,
     faults: Vec<Fault>,
-    flush_subset: Option<Vec<usize>>,
-    flush_order: Option<Vec<usize>>,
+    flush_subset: Option<Vec<u64>>,
+    flush_order: Option<Vec<u64>>,
     virtual_time: AtomicU64,
 }
 
@@ -161,9 +161,9 @@ impl SimDisk {
         config.clone().checked()?;
         Ok(Self::new(len, config))
     }
-    pub fn set_flush_order(&mut self, pending_indices: Vec<usize>) -> Result<(), DeviceError> {
-        self.validate_flush_indices(&pending_indices)?;
-        self.flush_order = Some(pending_indices);
+    pub fn set_flush_order(&mut self, operation_ids: Vec<u64>) -> Result<(), DeviceError> {
+        self.validate_flush_ids(&operation_ids)?;
+        self.flush_order = Some(operation_ids);
         Ok(())
     }
     pub fn corrupt_durable_range(&mut self, offset: u64, len: usize) -> Result<(), DeviceError> {
@@ -173,25 +173,27 @@ impl SimDisk {
         }
         Ok(())
     }
-    pub fn set_flush_subset(&mut self, pending_indices: Vec<usize>) -> Result<(), DeviceError> {
-        self.validate_flush_indices(&pending_indices)?;
-        self.flush_subset = Some(pending_indices);
+    pub fn set_flush_subset(&mut self, operation_ids: Vec<u64>) -> Result<(), DeviceError> {
+        self.validate_flush_ids(&operation_ids)?;
+        self.flush_subset = Some(operation_ids);
         Ok(())
     }
-    fn validate_flush_indices(&self, indices: &[usize]) -> Result<(), DeviceError> {
-        let mut seen = vec![false; self.pending.len()];
-        for &index in indices {
-            if index >= self.pending.len() {
+    fn validate_flush_ids(&self, operation_ids: &[u64]) -> Result<(), DeviceError> {
+        for (index, &operation_id) in operation_ids.iter().enumerate() {
+            if !self
+                .pending
+                .iter()
+                .any(|write| write.operation_id == operation_id)
+            {
                 return Err(DeviceError::InvalidConfig(
-                    "flush script index exceeds pending writes",
+                    "flush script operation ID does not match a pending write",
                 ));
             }
-            if seen[index] {
+            if operation_ids[..index].contains(&operation_id) {
                 return Err(DeviceError::InvalidConfig(
-                    "flush script contains a duplicate index",
+                    "flush script contains a duplicate operation ID",
                 ));
             }
-            seen[index] = true;
         }
         Ok(())
     }
@@ -266,34 +268,49 @@ impl SimDisk {
     fn apply_pending(&mut self) {
         if self.config.allow_reordering {
             self.pending
-                .sort_by_key(|w| (w.offset, Reverse(w.issued_at)));
+                .sort_by_key(|w| (w.offset, Reverse(w.operation_id)));
         }
         let writes = std::mem::take(&mut self.pending);
         let subset = self.flush_subset.take();
         let order = self
             .flush_order
             .take()
-            .unwrap_or_else(|| (0..writes.len()).collect());
+            .unwrap_or_else(|| writes.iter().map(|write| write.operation_id).collect());
         let mut writes: Vec<Option<PendingWrite>> = writes.into_iter().map(Some).collect();
-        for index in order {
-            let Some(w) = writes.get_mut(index).and_then(Option::take) else {
+        for operation_id in order {
+            let Some(index) = writes.iter().position(|write| {
+                write
+                    .as_ref()
+                    .is_some_and(|write| write.operation_id == operation_id)
+            }) else {
                 continue;
             };
-            if subset.as_ref().is_some_and(|s| !s.contains(&index)) {
+            let Some(w) = writes[index].take() else {
+                continue;
+            };
+            if subset
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&operation_id))
+            {
                 self.pending.push(w);
                 continue;
             }
-            let mut end = w.data.len();
-            if let Some(prefix) = w.tear_prefix {
-                end = prefix.min(end);
-                if end < self.config.atomic_write_size {
-                    end = 0;
-                } else {
-                    end -= end % self.config.atomic_write_size;
+            let end = w
+                .tear_prefix
+                .map_or(w.data.len(), |prefix| prefix.min(w.data.len()));
+            let mut cursor = 0;
+            while cursor < end {
+                let absolute_offset = w.offset as usize + cursor;
+                let unit_remaining =
+                    self.config.atomic_write_size - absolute_offset % self.config.atomic_write_size;
+                let segment_len = unit_remaining.min(w.data.len() - cursor);
+                if cursor + segment_len > end {
+                    break;
                 }
+                self.durable[absolute_offset..absolute_offset + segment_len]
+                    .copy_from_slice(&w.data[cursor..cursor + segment_len]);
+                cursor += segment_len;
             }
-            self.durable[w.offset as usize..w.offset as usize + end]
-                .copy_from_slice(&w.data[..end]);
         }
         self.pending.extend(writes.into_iter().flatten());
         // `volatile` already contains every issued write. Only crash resets it.
@@ -396,9 +413,9 @@ impl BlockDevice for SimDisk {
             let written = bytes.min(data.len());
             self.volatile[start..start + written].copy_from_slice(&data[..written]);
             self.pending.push(PendingWrite {
+                operation_id: op,
                 offset,
                 data: data[..written].to_vec(),
-                issued_at: op,
                 tear_prefix: None,
             });
             Some(DeviceError::Injected {
@@ -427,9 +444,9 @@ impl BlockDevice for SimDisk {
         }
         self.volatile[start..start + data.len()].copy_from_slice(&data);
         self.pending.push(PendingWrite {
+            operation_id: op,
             offset,
             data,
-            issued_at: op,
             tear_prefix,
         });
         self.apply_after_fault(op)
@@ -544,6 +561,76 @@ mod tests {
     }
 
     #[test]
+    fn flush_subset_uses_operation_ids_after_reordering() {
+        let mut d = SimDisk::new(
+            8,
+            SimConfig {
+                allow_reordering: true,
+                ..Default::default()
+            },
+        );
+        d.write_at(4, b"aaaa").unwrap(); // operation ID 0
+        d.write_at(0, b"bbbb").unwrap(); // operation ID 1; sorted first
+        d.set_flush_subset(vec![0]).unwrap();
+        d.flush_data().unwrap();
+
+        assert_eq!(&d.durable_bytes()[..4], b"\0\0\0\0");
+        assert_eq!(&d.durable_bytes()[4..8], b"aaaa");
+        assert_eq!(d.pending_writes(), 1);
+    }
+
+    #[test]
+    fn flush_order_uses_operation_ids_after_reordering() {
+        let mut d = SimDisk::new(
+            4,
+            SimConfig {
+                allow_reordering: true,
+                ..Default::default()
+            },
+        );
+        d.write_at(0, b"aaaa").unwrap();
+        d.write_at(0, b"bbbb").unwrap();
+        d.set_flush_order(vec![0, 1]).unwrap();
+        d.flush_data().unwrap();
+
+        assert_eq!(d.durable_bytes(), b"bbbb");
+    }
+
+    #[test]
+    fn flush_subset_uses_stable_operation_ids_when_writes_reorder() {
+        let mut d = SimDisk::new(
+            8,
+            SimConfig {
+                allow_reordering: true,
+                ..Default::default()
+            },
+        );
+        d.write_at(4, b"bbbb").unwrap(); // operation 0
+        d.write_at(0, b"aaaa").unwrap(); // operation 1; sorts before operation 0
+        d.set_flush_subset(vec![0]).unwrap();
+        d.flush_data().unwrap();
+
+        assert_eq!(&d.durable_bytes()[..8], b"\0\0\0\0bbbb");
+    }
+
+    #[test]
+    fn flush_order_uses_stable_operation_ids_when_writes_reorder() {
+        let mut d = SimDisk::new(
+            4,
+            SimConfig {
+                allow_reordering: true,
+                ..Default::default()
+            },
+        );
+        d.write_at(0, b"aaaa").unwrap(); // operation 0
+        d.write_at(0, b"bbbb").unwrap(); // operation 1; sorts before operation 0
+        d.set_flush_order(vec![0, 1]).unwrap();
+        d.flush_data().unwrap();
+
+        assert_eq!(d.durable_bytes(), b"bbbb");
+    }
+
+    #[test]
     fn atomic_size_limits_torn_persistence_to_units() {
         let mut d = SimDisk::new(
             8,
@@ -560,6 +647,26 @@ mod tests {
         d.write_at(0, b"abcd").unwrap();
         d.flush_data().unwrap();
         assert_eq!(&d.durable_bytes()[..4], b"\0\0\0\0");
+    }
+
+    #[test]
+    fn atomic_size_uses_absolute_units_for_unaligned_writes() {
+        let mut d = SimDisk::new(
+            8,
+            SimConfig {
+                atomic_write_size: 4,
+                allow_torn_writes: true,
+                ..Default::default()
+            },
+        )
+        .with_fault(Fault::TearWrite {
+            op: 0,
+            durable_prefix: 2,
+        });
+        d.write_at(2, b"abcd").unwrap();
+        d.flush_data().unwrap();
+
+        assert_eq!(d.durable_bytes(), b"\0\0ab\0\0\0\0");
     }
 
     #[test]
