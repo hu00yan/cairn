@@ -1,0 +1,5 @@
+/target/
+/.codebase-memory/
+**/*.swp
+**/*.swo
+

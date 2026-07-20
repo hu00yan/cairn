@@ -1,0 +1,12 @@
+[package]
+name = "cairn-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/new_core.rs"
+
+[dependencies]
+blake3.workspace = true
+cairn-device = { path = "../device" }
