@@ -1,7 +1,15 @@
 use std::cmp::Reverse;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(unix, windows))]
+mod file_device;
+
+#[cfg(any(unix, windows))]
+pub use file_device::FileDevice;
+
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeviceError {
     OutOfBounds {
@@ -10,10 +18,27 @@ pub enum DeviceError {
         capacity: u64,
     },
     InvalidConfig(&'static str),
+    Io {
+        operation: IoOperation,
+        kind: io::ErrorKind,
+    },
     Injected {
         op: u64,
         kind: FaultKind,
     },
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoOperation {
+    Open,
+    Metadata,
+    Read,
+    Write,
+    SetLen,
+    SyncData,
+    SyncAll,
+    SyncDirectory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
