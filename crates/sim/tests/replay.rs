@@ -2,7 +2,7 @@ use std::process::Command;
 
 use cairn_sim::replay::{
     decode_json, encode_json, replay, CrashPoint, CrashTiming, DiskSpec, MutationPhase, ReplayCase,
-    ReplayError, StoreOp, MAX_REPLAY_INPUT_BYTES,
+    ReplayError, RootReport, StoreOp, MAX_REPLAY_INPUT_BYTES,
 };
 
 fn base_case() -> ReplayCase {
@@ -59,6 +59,20 @@ fn nonzero_latency_is_included_in_the_final_report_snapshot() {
     let slow = replay(&slow_case).unwrap();
     assert!(slow.virtual_time > fast.virtual_time);
     assert_eq!(slow, replay(&slow_case).unwrap());
+}
+
+#[test]
+fn maximum_generation_remains_replayable() {
+    let mut case = base_case();
+    case.operations[2] = StoreOp::CommitRoot {
+        manifest_slot: 0,
+        generation: u64::MAX,
+    };
+    let report = replay(&case).unwrap();
+    assert_eq!(
+        report.recovered_root.as_ref().map(|root| root.generation),
+        Some(u64::MAX)
+    );
 }
 
 #[test]
@@ -135,6 +149,273 @@ fn transaction_crash_cut_matrix_preserves_the_right_root() {
             }
         }
     }
+}
+
+fn two_generation_case() -> ReplayCase {
+    ReplayCase {
+        version: 1,
+        seed: None,
+        disk: DiskSpec::default(),
+        operations: vec![
+            StoreOp::PutChunk {
+                slot: 0,
+                bytes: b"alpha".to_vec(),
+            },
+            StoreOp::PutManifest {
+                slot: 0,
+                chunks: vec![cairn_sim::replay::ChunkSpec {
+                    chunk_slot: 0,
+                    len: 5,
+                }],
+            },
+            StoreOp::CommitRoot {
+                manifest_slot: 0,
+                generation: 10,
+            },
+            StoreOp::PutChunk {
+                slot: 1,
+                bytes: b"bravo!".to_vec(),
+            },
+            StoreOp::PutManifest {
+                slot: 1,
+                chunks: vec![cairn_sim::replay::ChunkSpec {
+                    chunk_slot: 1,
+                    len: 6,
+                }],
+            },
+            StoreOp::CommitRoot {
+                manifest_slot: 1,
+                generation: 20,
+            },
+            StoreOp::CrashReopen,
+        ],
+        crash: None,
+    }
+}
+
+fn independent_chunk_id(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cairn/chunk/v1\0");
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn independent_manifest_id(chunk: [u8; 32], len: u32) -> [u8; 32] {
+    let mut body = Vec::with_capacity(52);
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&u64::from(len).to_le_bytes());
+    body.extend_from_slice(&chunk);
+    body.extend_from_slice(&len.to_le_bytes());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cairn/manifest/v1\0");
+    hasher.update(&body);
+    *hasher.finalize().as_bytes()
+}
+
+#[test]
+fn two_generation_crash_cuts_use_independent_roots_and_operation_ids() {
+    let phases = [
+        [
+            MutationPhase::RecordHeaderWrite,
+            MutationPhase::RecordPayloadWrite,
+            MutationPhase::RecordFlush,
+        ]
+        .as_slice(),
+        [
+            MutationPhase::RecordHeaderWrite,
+            MutationPhase::RecordPayloadWrite,
+            MutationPhase::RecordFlush,
+        ]
+        .as_slice(),
+        [
+            MutationPhase::RecordHeaderWrite,
+            MutationPhase::RecordPayloadWrite,
+            MutationPhase::RecordFlush,
+            MutationPhase::SuperblockWrite,
+            MutationPhase::SuperblockFlush,
+        ]
+        .as_slice(),
+    ];
+    let alpha = independent_chunk_id(b"alpha");
+    let bravo = independent_chunk_id(b"bravo!");
+    let old_manifest = independent_manifest_id(alpha, 5);
+    let new_manifest = independent_manifest_id(bravo, 6);
+    for (target_step, target_phases) in phases.into_iter().enumerate() {
+        let step = target_step + 3;
+        for &phase in target_phases {
+            for timing in [CrashTiming::Before, CrashTiming::After] {
+                let mut case = two_generation_case();
+                case.operations.truncate(step + 1);
+                case.operations.push(StoreOp::CrashReopen);
+                case.crash = Some(CrashPoint {
+                    step: step as u16,
+                    phase,
+                    timing,
+                });
+                let report = replay(&case).unwrap();
+                let phase_offset = match phase {
+                    MutationPhase::RecordHeaderWrite => 0,
+                    MutationPhase::RecordPayloadWrite => 1,
+                    MutationPhase::RecordFlush => 2,
+                    MutationPhase::SuperblockWrite => 3,
+                    MutationPhase::SuperblockFlush => 4,
+                };
+                let expected_op = [14u64, 17, 20][target_step] + phase_offset;
+                let published = target_step == 2
+                    && phase == MutationPhase::SuperblockFlush
+                    && timing == CrashTiming::After;
+                let expected_root = if published {
+                    RootReport {
+                        generation: 20,
+                        manifest: new_manifest,
+                    }
+                } else {
+                    RootReport {
+                        generation: 10,
+                        manifest: old_manifest,
+                    }
+                };
+                assert_eq!(report.recovered_root, Some(expected_root));
+                assert_eq!(report.resolved_fault_op, Some(expected_op));
+                assert_eq!(
+                    report.steps[step].outcome,
+                    cairn_sim::replay::StepOutcome::InjectedCrash
+                );
+                assert_eq!(
+                    report
+                        .steps
+                        .iter()
+                        .filter(|step| step.outcome == cairn_sim::replay::StepOutcome::Reopened)
+                        .count(),
+                    1
+                );
+                assert_eq!(report, replay(&case).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_puts_and_rejected_generations_do_not_hide_fault_cursor_errors() {
+    let duplicate = ReplayCase {
+        version: 1,
+        seed: None,
+        disk: DiskSpec::default(),
+        operations: vec![
+            StoreOp::PutChunk {
+                slot: 0,
+                bytes: b"same".to_vec(),
+            },
+            StoreOp::PutChunk {
+                slot: 1,
+                bytes: b"same".to_vec(),
+            },
+            StoreOp::PutManifest {
+                slot: 0,
+                chunks: vec![cairn_sim::replay::ChunkSpec {
+                    chunk_slot: 0,
+                    len: 4,
+                }],
+            },
+            StoreOp::PutManifest {
+                slot: 1,
+                chunks: vec![cairn_sim::replay::ChunkSpec {
+                    chunk_slot: 0,
+                    len: 4,
+                }],
+            },
+            StoreOp::CommitRoot {
+                manifest_slot: 1,
+                generation: 1,
+            },
+            StoreOp::CrashReopen,
+        ],
+        crash: Some(CrashPoint {
+            step: 4,
+            phase: MutationPhase::RecordHeaderWrite,
+            timing: CrashTiming::Before,
+        }),
+    };
+    let report = replay(&duplicate).unwrap();
+    assert_eq!(report.resolved_fault_op, Some(12));
+    assert_eq!(
+        report.steps[1].outcome,
+        cairn_sim::replay::StepOutcome::Accepted
+    );
+    let mut generations = two_generation_case();
+    generations.operations.insert(
+        3,
+        StoreOp::CommitRoot {
+            manifest_slot: 0,
+            generation: 10,
+        },
+    );
+    generations.operations.insert(
+        4,
+        StoreOp::CommitRoot {
+            manifest_slot: 0,
+            generation: 9,
+        },
+    );
+    generations.operations.pop();
+    generations.operations.push(StoreOp::CrashReopen);
+    generations.crash = Some(CrashPoint {
+        step: 7,
+        phase: MutationPhase::SuperblockFlush,
+        timing: CrashTiming::After,
+    });
+    let report = replay(&generations).unwrap();
+    assert_eq!(
+        report.steps[3].outcome,
+        cairn_sim::replay::StepOutcome::Rejected {
+            reason: cairn_sim::replay::RejectionReason::InvalidGeneration,
+        }
+    );
+    assert_eq!(
+        report.steps[4].outcome,
+        cairn_sim::replay::StepOutcome::Rejected {
+            reason: cairn_sim::replay::RejectionReason::InvalidGeneration,
+        }
+    );
+    assert_eq!(report.resolved_fault_op, Some(24));
+    assert_eq!(
+        report.recovered_root.as_ref().map(|root| root.generation),
+        Some(20)
+    );
+}
+
+#[test]
+fn invalid_manifest_can_be_visible_as_a_record_but_never_as_a_root() {
+    let mut case = two_generation_case();
+    case.operations[4] = StoreOp::PutManifest {
+        slot: 1,
+        chunks: vec![cairn_sim::replay::ChunkSpec {
+            chunk_slot: 1,
+            len: 5,
+        }],
+    };
+    case.operations[5] = StoreOp::PutManifest {
+        slot: 2,
+        chunks: vec![cairn_sim::replay::ChunkSpec {
+            chunk_slot: 0,
+            len: 5,
+        }],
+    };
+    case.operations.insert(
+        6,
+        StoreOp::CommitRoot {
+            manifest_slot: 2,
+            generation: 20,
+        },
+    );
+    case.operations[7] = StoreOp::CrashReopen;
+    let report = replay(&case).unwrap();
+    assert_eq!(
+        report.recovered_root.as_ref().map(|root| root.generation),
+        Some(20)
+    );
 }
 
 #[test]

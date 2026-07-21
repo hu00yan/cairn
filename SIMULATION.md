@@ -80,6 +80,26 @@ cargo run -p cairn-sim --bin cairn-replay -- crates/sim/tests/fixtures/v1-basic.
 cargo run -p cairn-sim --bin cairn-replay -- crates/sim/tests/fixtures/v1-crash-after-superblock-flush.json
 ```
 
+## SR-02: replay trust boundary
+
+SR-02 adds a private pure-computation oracle to the replay runner. It does not
+use `cairn-model`, the physical fault planner, or device operation IDs. The
+oracle independently computes object IDs, manifest validity, pending versus
+visible objects, and recovery roots.
+
+The fixed two-generation matrix starts with generation 10, stages generation
+20, and checks all 22 crash cuts. It requires the old root to survive every
+cut except `CrashAfter(SuperblockFlush)`, where the call still returns an
+injected crash but recovery must expose generation 20. Recovery probes chunks
+and manifests separately, including records that are physically visible but
+logically invalid. If the recovered generation is `u64::MAX`, root and chunk
+visibility checks still run; manifest terminal probes are skipped because the
+core API requires a strictly larger probe generation.
+
+This remains a bounded single-node trust layer. It does not claim coverage for
+torn/reordered writes, multiple faults, format crash, compaction, EC,
+replication, networking, or filesystem durability.
+
 ## Fault dimensions
 
 The minimum simulation surface is:

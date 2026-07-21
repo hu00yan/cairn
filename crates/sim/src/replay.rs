@@ -8,6 +8,10 @@ use cairn_device::{DeviceError, Fault, LatencyProfile, SimConfig, SimDisk};
 use cairn_model::{ChunkRef as ModelChunkRef, Model};
 use serde::{Deserialize, Serialize};
 
+mod oracle;
+
+use oracle::{OraclePlan, OracleSnapshot};
+
 pub const REPLAY_VERSION: u16 = 1;
 pub const MAX_REPLAY_INPUT_BYTES: usize = 1024 * 1024;
 const MIN_CAPACITY: u32 = 16 * 1024;
@@ -302,38 +306,7 @@ impl ReplayCase {
                 self.disk.capacity_bytes
             )));
         }
-        if let Some(point) = &self.crash {
-            let target = &self.operations[usize::from(point.step)];
-            if phase_offset(target, point.phase).is_none() {
-                return Err(ReplayError::InvalidCase(format!(
-                    "phase {:?} does not apply to step {}",
-                    point.phase, point.step
-                )));
-            }
-            let mut model = Model::default();
-            let mut chunk_slots = HashMap::new();
-            let mut manifest_slots = HashMap::new();
-            for (step, operation) in self
-                .operations
-                .iter()
-                .enumerate()
-                .take(usize::from(point.step) + 1)
-            {
-                let mutations = plan_operation(
-                    step,
-                    operation,
-                    &mut model,
-                    &mut chunk_slots,
-                    &mut manifest_slots,
-                )
-                .map_err(|error| ReplayError::InvalidCase(error.to_string()))?;
-                if step == usize::from(point.step) && mutations == 0 {
-                    return Err(ReplayError::InvalidCase(
-                        "crash point targets an operation with no mutation".into(),
-                    ));
-                }
-            }
-        }
+        OraclePlan::from_case(self).map_err(|error| ReplayError::InvalidCase(error.to_string()))?;
         Ok(())
     }
 }
@@ -361,6 +334,8 @@ pub fn encode_report(report: &ReplayReport) -> Result<Vec<u8>, ReplayError> {
 
 pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
     case.validate()?;
+    let oracle =
+        OraclePlan::from_case(case).map_err(|error| ReplayError::InvalidCase(error.to_string()))?;
     let fault = resolve_fault(case)?;
     let resolved_fault_op = fault.as_ref().map(fault_operation);
     let config = SimConfig {
@@ -385,7 +360,6 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
     let mut model = Model::default();
     let mut chunk_slots = HashMap::<u8, [u8; 32]>::new();
     let mut manifest_slots = HashMap::<u8, [u8; 32]>::new();
-    let mut all_chunks = HashSet::<[u8; 32]>::new();
     let mut reports = Vec::with_capacity(case.operations.len());
     let mut fault_triggered = false;
     let mut recovery_required = false;
@@ -410,8 +384,10 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
                             if core_id != model_id {
                                 return Err(divergence(index, "chunk IDs differ"));
                             }
+                            if oracle.steps[index].chunk_id != Some(core_id) {
+                                return Err(divergence(index, "oracle chunk ID differs"));
+                            }
                             chunk_slots.insert(*slot, core_id);
-                            all_chunks.insert(core_id);
                             StepOutcome::Accepted
                         }
                         (Err(core_error), Err(model_error)) => compare_rejections(
@@ -450,6 +426,9 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
                             if core_id != model_id {
                                 return Err(divergence(index, "manifest IDs differ"));
                             }
+                            if oracle.steps[index].manifest_id != Some(core_id) {
+                                return Err(divergence(index, "oracle manifest ID differs"));
+                            }
                             manifest_slots.insert(*slot, core_id);
                             StepOutcome::Accepted
                         }
@@ -487,27 +466,13 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
                 if is_injected_crash(&core_result) {
                     fault_triggered = true;
                     recovery_required = true;
-                    if matches!(
-                        case.crash.as_ref(),
-                        Some(CrashPoint {
-                            phase: MutationPhase::SuperblockFlush,
-                            timing: CrashTiming::After,
-                            step,
-                        }) if usize::from(*step) == index
-                    ) {
-                        model.commit_root(manifest, *generation).map_err(|error| {
-                            divergence(
-                                index,
-                                &format!("model could not publish crash-durable root: {error:?}"),
-                            )
-                        })?;
-                    }
                     StepOutcome::InjectedCrash
                 } else {
                     let model_result = model.commit_root(manifest, *generation);
                     match (core_result, model_result) {
                         (Ok(core_root), Ok(model_root)) => {
                             compare_roots(index, &core_root, &model_root)?;
+                            compare_oracle_root(index, &core_root, oracle.steps[index].root)?;
                             StepOutcome::Accepted
                         }
                         (Err(core_error), Err(model_error)) => compare_rejections(
@@ -535,14 +500,23 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
                 let device = core.into_device();
                 let mut device = device;
                 device.crash();
+                let probe_device = device.clone();
                 core = Store::open(device)
                     .map_err(|error| ReplayError::Core(format!("reopen failed: {error:?}")))?;
-                model = model.crash_reopen();
-                compare_visible_state(index, &mut core, &model, &all_chunks)?;
+                compare_visible_state(index, &mut core, &oracle.snapshot, &probe_device)?;
                 recovery_required = false;
                 StepOutcome::Reopened
             }
         };
+        if outcome != oracle.steps[index].outcome {
+            return Err(divergence(
+                index,
+                &format!(
+                    "oracle expected {:?}, execution returned {:?}",
+                    oracle.steps[index].outcome, outcome
+                ),
+            ));
+        }
         reports.push(StepReport {
             step: index as u16,
             outcome,
@@ -820,18 +794,35 @@ fn compare_roots(
     Ok(())
 }
 
+fn compare_oracle_root(
+    step: usize,
+    core: &CoreRoot,
+    oracle: Option<oracle::OracleRoot>,
+) -> Result<(), ReplayError> {
+    let Some(oracle) = oracle else {
+        return Err(divergence(step, "oracle did not publish an accepted root"));
+    };
+    if core.generation != oracle.generation || core.manifest != oracle.manifest {
+        return Err(divergence(step, "oracle root values differ"));
+    }
+    Ok(())
+}
+
 fn compare_visible_state(
     step: usize,
     core: &mut Store<SimDisk>,
-    model: &Model,
-    chunks: &HashSet<[u8; 32]>,
+    oracle: &OracleSnapshot,
+    probe_device: &SimDisk,
 ) -> Result<(), ReplayError> {
     let core_root = core.current_root().map(root_report);
-    let model_root = model.current_root().map(model_root_report);
-    if core_root != model_root {
+    let oracle_root = oracle.root.map(|root| RootReport {
+        generation: root.generation,
+        manifest: root.manifest,
+    });
+    if core_root != oracle_root {
         return Err(divergence(step, "recovered roots differ"));
     }
-    for id in chunks {
+    for id in oracle.known_chunks.keys() {
         let core_bytes = match core.get_bytes(id) {
             Ok(bytes) => Some(bytes),
             Err(CoreError::NotFound(_)) => None,
@@ -841,22 +832,71 @@ fn compare_visible_state(
                 )))
             }
         };
-        let model_bytes = model.get(id).map(ToOwned::to_owned);
-        if core_bytes != model_bytes {
+        let oracle_bytes = oracle.visible_chunks.get(id).map(Vec::as_slice);
+        if core_bytes.as_deref() != oracle_bytes {
             return Err(divergence(step, "recovered chunk visibility differs"));
+        }
+    }
+    let Some(current_generation) = core.current_root().map(|root| root.generation) else {
+        return Ok(());
+    };
+    if current_generation == u64::MAX {
+        return Ok(());
+    }
+    let generation = current_generation + 1;
+    for id in oracle.known_manifests.keys() {
+        let actual = probe_manifest(probe_device, *id, generation)?;
+        let expected = oracle_manifest_visibility(oracle, id);
+        if actual != expected {
+            return Err(divergence(step, "recovered manifest visibility differs"));
         }
     }
     Ok(())
 }
 
-fn root_report(root: cairn_core::Root) -> RootReport {
-    RootReport {
-        generation: root.generation,
-        manifest: root.manifest,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManifestVisibility {
+    Hidden,
+    Valid,
+    Invalid,
+}
+
+fn oracle_manifest_visibility(oracle: &OracleSnapshot, id: &[u8; 32]) -> ManifestVisibility {
+    let Some(manifest) = oracle.visible_manifests.get(id) else {
+        return ManifestVisibility::Hidden;
+    };
+    if manifest.chunks.iter().all(|chunk| {
+        oracle
+            .visible_chunks
+            .get(&chunk.id)
+            .is_some_and(|bytes| bytes.len() == chunk.len as usize)
+    }) {
+        ManifestVisibility::Valid
+    } else {
+        ManifestVisibility::Invalid
     }
 }
 
-fn model_root_report(root: cairn_model::Root) -> RootReport {
+fn probe_manifest(
+    device: &SimDisk,
+    manifest: [u8; 32],
+    generation: u64,
+) -> Result<ManifestVisibility, ReplayError> {
+    let mut probe = Store::open(device.clone())
+        .map_err(|error| ReplayError::Core(format!("manifest probe open failed: {error:?}")))?;
+    match probe.commit_root(manifest, generation) {
+        Ok(_) => Ok(ManifestVisibility::Valid),
+        Err(CoreError::NotFound(id)) if id == manifest => Ok(ManifestVisibility::Hidden),
+        Err(CoreError::NotFound(_)) | Err(CoreError::Corruption(_)) => {
+            Ok(ManifestVisibility::Invalid)
+        }
+        Err(error) => Err(ReplayError::Core(format!(
+            "manifest probe failed: {error:?}"
+        ))),
+    }
+}
+
+fn root_report(root: cairn_core::Root) -> RootReport {
     RootReport {
         generation: root.generation,
         manifest: root.manifest,
@@ -890,5 +930,39 @@ fn fault_operation(fault: &Fault) -> u64 {
         | Fault::ShortWrite { op: operation, .. }
         | Fault::TearWrite { op: operation, .. } => *operation,
         Fault::ReadFail { .. } => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_probe_distinguishes_hidden_and_missing_chunk() {
+        let disk = SimDisk::new(64 * 1024, SimConfig::default());
+        let mut store = Store::format(disk).unwrap();
+        let missing_chunk = [0x5a; 32];
+        let invalid_manifest = store
+            .put_manifest(&[CoreChunkRef {
+                id: missing_chunk,
+                len: 1,
+            }])
+            .unwrap();
+        let chunk = store.put_bytes(b"ok").unwrap();
+        let valid_manifest = store
+            .put_manifest(&[CoreChunkRef { id: chunk, len: 2 }])
+            .unwrap();
+        store.commit_root(valid_manifest, 1).unwrap();
+        let mut device = store.into_device();
+        device.crash();
+
+        assert_eq!(
+            probe_manifest(&device, invalid_manifest, 2).unwrap(),
+            ManifestVisibility::Invalid
+        );
+        assert_eq!(
+            probe_manifest(&device, [0; 32], 2).unwrap(),
+            ManifestVisibility::Hidden
+        );
     }
 }
