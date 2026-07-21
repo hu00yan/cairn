@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "disk": {
+    "capacity_bytes": 262144,
+    "latency": {}
+  },
+  "operations": [
+    {
+      "op": "put_chunk",
+      "slot": 0,
+      "bytes": [104, 101, 108, 108, 111]
+    },
+    {
+      "op": "put_manifest",
+      "slot": 0,
+      "chunks": [
+        {
+          "chunk_slot": 0,
+          "len": 5
+        }
+      ]
+    },
+    {
+      "op": "commit_root",
+      "manifest_slot": 0,
+      "generation": 1
+    },
+    {
+      "op": "crash_reopen"
+    }
+  ],
+  "crash": {
+    "step": 2,
+    "phase": "superblock_flush",
+    "timing": "after"
+  }
+}

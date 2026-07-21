@@ -56,6 +56,30 @@ The next simulator-only additions are broader property/state-machine
 generators and a standalone replay runner. They must stay on these in-memory
 seams before the storage core starts depending on them.
 
+## SR-01: bounded store replay
+
+The first replay slice uses a versioned JSON case and runs the same bounded
+store operations against `cairn-core + SimDisk` and `cairn-model`. It supports
+`put_chunk`, `put_manifest`, `commit_root`, and a final `crash_reopen`. A case
+may inject one deterministic crash immediately before the final reopen. The
+crash phases cover record header, record payload, record flush, superblock
+write, and superblock flush, each before or after the selected operation.
+
+The runner is intentionally single-node: it does not use `FileDevice`,
+`SimNetwork`, sockets, wall-clock sleeps, torn writes, or multi-fault schedules.
+Cases are bounded to 64 operations, 32 slots, 4 KiB per chunk, 64 KiB total
+payload, and a 16 KiB–1 MiB simulated disk. The JSON runner also rejects
+inputs larger than 1 MiB before deserialization, so the CLI's input bound is
+enforced before constructing an untrusted case.
+
+Run the replay tests and fixtures with:
+
+```text
+cargo test -p cairn-sim --all-targets --offline
+cargo run -p cairn-sim --bin cairn-replay -- crates/sim/tests/fixtures/v1-basic.json
+cargo run -p cairn-sim --bin cairn-replay -- crates/sim/tests/fixtures/v1-crash-after-superblock-flush.json
+```
+
 ## Fault dimensions
 
 The minimum simulation surface is:

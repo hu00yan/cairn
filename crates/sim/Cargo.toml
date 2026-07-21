@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cairn-core = { path = "../core" }
+cairn-device = { path = "../device" }
+cairn-model = { path = "../model" }
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true

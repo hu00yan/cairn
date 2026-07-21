@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+pub mod replay;
+
 use std::collections::{HashMap, HashSet};
 
 pub type NodeId = u16;
