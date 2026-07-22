@@ -100,6 +100,35 @@ This remains a bounded single-node trust layer. It does not claim coverage for
 torn/reordered writes, multiple faults, format crash, compaction, EC,
 replication, networking, or filesystem durability.
 
+## SR-03: deterministic state-machine corpus
+
+SR-03 adds an in-tree SplitMix64 generator and deterministic shrinker. It
+generates bounded multi-generation traces with duplicate writes, empty and
+mis-sized manifest references, rejected generations, latency variation, and a
+randomly selected final chunk, manifest, or valid root operation. Most seeds
+also cut that operation at a valid write or flush phase before `crash_reopen`.
+
+The default corpus runs 10,000 seeds in `crates/sim/tests/state_machine.rs`.
+Each seed is stored in the `ReplayCase.seed` field, and a failure is reduced in
+a fixed order (remove operations, then payloads and generations) before the
+test prints JSON accepted by `cairn-replay`. The generator adds no third-party
+dependency and does not replace the independent replay oracle.
+
+The corpus has hard coverage assertions for duplicate payloads, mis-sized
+references, accepted/rejected generations, both crash timings, all applicable
+crash phases, all three final operation kinds, and no-crash cases. It also
+stores cross-platform golden hashes for representative seeds and keeps a
+failure's structured class during shrinking. A core failure class includes its
+recovery stage and, when applicable, the underlying device failure kind, so a
+short I/O cannot be shrunk into a media error merely because both happened
+during reopen.
+
+This is a coverage amplifier, not a claim that the single-node simulator is
+complete. The device-only HAL now has event-based rules for torn writes,
+non-crash I/O failures, read failures, bad media, and deterministic latency.
+The storage replay runner still uses its version-1 compatibility fault cursor;
+the new device rules are not yet serialized into that upper-layer corpus.
+
 ## Fault dimensions
 
 The minimum simulation surface is:
@@ -115,3 +144,52 @@ The minimum simulation surface is:
 The simulator must not attempt to reproduce SSD firmware, physical seek,
 NVMe/SATA timing, or every operating-system cache behavior. Those are separate
 performance experiments, not correctness prerequisites.
+
+## SR-04: block-device HAL direction
+
+The simulator's correctness seam is the `BlockDevice` contract, not a disk
+brand or a filesystem implementation. `SimDisk` models one deterministic
+device with four deliberately small dimensions:
+
+1. **Physical range** — every read/write has a half-open byte range. Bad media
+   is a persistent set of ranges; an overlapping read or write returns a stable
+   device error.
+2. **Persistence** — a successful write updates the volatile device view and a
+   pending write set. A dropped write is acknowledged but updates neither.
+   `flush_data`/`flush_all` advance selected writes to the durable medium.
+   `crash` discards pending state and rebuilds the volatile view from durable
+   bytes.
+3. **Device events** — each device call internally records a monotonic event
+   with kind, range, effect, and sequence number. Fault rules match device
+   event kind, physical range, and a device event sequence. They never match a
+   Cairn core operation ID. Legacy operation faults and device event faults are
+   mutually exclusive, so an injected error has an explicit operation or event
+   source instead of an ambiguous `op` field.
+   The event clock is protected by one mutex: concurrent observational reads
+   are linearized there, and virtual latency accumulates in that same order.
+4. **Virtual time** — each event gets `base_latency + seeded_jitter`. The
+   jitter is a pure function of the device seed and event sequence, so the same
+   initial bytes, call sequence, and script produce the same trace.
+
+The fault vocabulary stays at the device boundary: error, timeout, dropped
+write, short write, torn write at atomic units, crash before/after an event,
+and bounded flush reordering. HDD-like seek/rotation delay, SSD queueing,
+garbage-collection stalls, thermal slowdown, and periodic media degradation are
+latency or fault policies over these same events; they do not become separate
+core APIs. The model intentionally does not simulate firmware algorithms or
+filesystem directories.
+
+This follows the useful Linux boundary: blk-mq may queue, merge, and reorder
+requests and does not guarantee completion order; volatile write-back caches
+need explicit flushes for data-integrity points; block error injection is
+expressed as operation plus sector range; and device-mapper exposes delay and
+periodic flakiness as composable device behaviors. See the [Linux blk-mq
+documentation](https://www.kernel.org/doc/html/latest/block/blk-mq.html),
+[volatile write-back cache control](https://docs.kernel.org/block/writeback_cache_control.html),
+[block error injection](https://www.kernel.org/doc/html/next/block/error-injection.html),
+and [`dm-delay`/`dm-flakey`](https://docs.kernel.org/admin-guide/device-mapper/delay.html).
+
+SR-04 implementation order is event trace, seeded latency, persistent bad
+ranges, event fault rules, then torn/reordered flush behavior. Each layer gets
+device-only properties first; the storage property runner consumes only the
+device script and the resulting trace.

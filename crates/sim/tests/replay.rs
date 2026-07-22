@@ -55,6 +55,7 @@ fn nonzero_latency_is_included_in_the_final_report_snapshot() {
         write_ticks: 11,
         flush_data_ticks: 13,
         flush_all_ticks: 17,
+        ..Default::default()
     };
     let slow = replay(&slow_case).unwrap();
     assert!(slow.virtual_time > fast.virtual_time);

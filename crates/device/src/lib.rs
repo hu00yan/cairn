@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 #[cfg(any(unix, windows))]
 mod file_device;
@@ -23,9 +23,15 @@ pub enum DeviceError {
         kind: io::ErrorKind,
     },
     Injected {
-        op: u64,
+        at: InjectionSite,
         kind: FaultKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InjectionSite {
+    Operation(u64),
+    Event(u64),
 }
 
 #[non_exhaustive]
@@ -41,11 +47,12 @@ pub enum IoOperation {
     SyncDirectory,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultKind {
     Failed,
     Crashed,
     Dropped,
+    MediaError,
     ReadFailed,
     ShortIo,
     Timeout,
@@ -67,6 +74,128 @@ pub trait BlockDevice: Send + Sync + 'static {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError>;
     fn flush_data(&mut self) -> Result<(), DeviceError>;
     fn flush_all(&mut self) -> Result<(), DeviceError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceEventKind {
+    Read,
+    Write,
+    FlushData,
+    FlushAll,
+    Crash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceEventOutcome {
+    Completed,
+    Dropped,
+    Short { bytes: usize },
+    Torn { durable_prefix: usize },
+    Failed,
+    Crashed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceEvent {
+    pub sequence: u64,
+    pub kind: DeviceEventKind,
+    pub offset: u64,
+    pub len: usize,
+    pub virtual_time: u64,
+    pub outcome: DeviceEventOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl ByteRange {
+    fn intersects(self, offset: u64, len: usize) -> bool {
+        let end = offset.saturating_add(len as u64);
+        let range_end = self.offset.saturating_add(self.len);
+        offset < range_end && self.offset < end
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceFaultAction {
+    Fail,
+    Timeout,
+    Drop,
+    Short { bytes: usize },
+    Tear { durable_prefix: usize },
+    CrashBefore,
+    CrashAfter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceFaultRule {
+    pub kind: DeviceEventKind,
+    pub event_sequence: u64,
+    pub range: Option<ByteRange>,
+    pub action: DeviceFaultAction,
+}
+
+impl DeviceFaultRule {
+    fn validate(self, capacity: u64, allow_torn_writes: bool) -> Result<(), DeviceError> {
+        if self.range.is_some_and(|range| range.len == 0) {
+            return Err(DeviceError::InvalidConfig(
+                "device fault range must be non-empty",
+            ));
+        }
+        if self.range.is_some_and(|range| {
+            range
+                .offset
+                .checked_add(range.len)
+                .is_none_or(|end| end > capacity)
+        }) {
+            return Err(DeviceError::InvalidConfig(
+                "device fault range exceeds device capacity",
+            ));
+        }
+        match self.kind {
+            DeviceEventKind::Read => match self.action {
+                DeviceFaultAction::Fail | DeviceFaultAction::Timeout => Ok(()),
+                _ => Err(DeviceError::InvalidConfig(
+                    "read faults only support fail and timeout",
+                )),
+            },
+            DeviceEventKind::Write => match self.action {
+                DeviceFaultAction::Fail
+                | DeviceFaultAction::Timeout
+                | DeviceFaultAction::Drop
+                | DeviceFaultAction::Short { .. }
+                | DeviceFaultAction::CrashBefore
+                | DeviceFaultAction::CrashAfter => Ok(()),
+                DeviceFaultAction::Tear { .. } if allow_torn_writes => Ok(()),
+                DeviceFaultAction::Tear { .. } => Err(DeviceError::InvalidConfig(
+                    "torn writes require allow_torn_writes",
+                )),
+            },
+            DeviceEventKind::FlushData | DeviceEventKind::FlushAll => {
+                if self.range.is_some() {
+                    return Err(DeviceError::InvalidConfig(
+                        "flush fault rules cannot have a byte range",
+                    ));
+                }
+                match self.action {
+                    DeviceFaultAction::Fail
+                    | DeviceFaultAction::Timeout
+                    | DeviceFaultAction::Drop
+                    | DeviceFaultAction::CrashBefore
+                    | DeviceFaultAction::CrashAfter => Ok(()),
+                    _ => Err(DeviceError::InvalidConfig(
+                        "flush faults only support fail, timeout, drop, and crash",
+                    )),
+                }
+            }
+            DeviceEventKind::Crash => Err(DeviceError::InvalidConfig(
+                "crash is a trace event, not a fault rule target",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +223,8 @@ pub struct LatencyProfile {
     pub write_ticks: u64,
     pub flush_data_ticks: u64,
     pub flush_all_ticks: u64,
+    pub jitter_ticks: u64,
+    pub seed: u64,
 }
 
 impl SimConfig {
@@ -127,6 +258,12 @@ struct PendingWrite {
     tear_prefix: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct EventClock {
+    next_sequence: u64,
+    virtual_time: u64,
+}
+
 #[derive(Debug)]
 pub struct SimDisk {
     durable: Vec<u8>,
@@ -137,7 +274,10 @@ pub struct SimDisk {
     faults: Vec<Fault>,
     flush_subset: Option<Vec<u64>>,
     flush_order: Option<Vec<u64>>,
-    virtual_time: AtomicU64,
+    clock: Mutex<EventClock>,
+    trace: Mutex<Vec<DeviceEvent>>,
+    bad_ranges: Vec<(u64, u64)>,
+    device_faults: Vec<DeviceFaultRule>,
 }
 
 impl SimDisk {
@@ -154,14 +294,25 @@ impl SimDisk {
             faults: Vec::new(),
             flush_subset: None,
             flush_order: None,
-            virtual_time: AtomicU64::new(0),
+            clock: Mutex::new(EventClock::default()),
+            trace: Mutex::new(Vec::new()),
+            bad_ranges: Vec::new(),
+            device_faults: Vec::new(),
         }
     }
     pub fn with_fault(mut self, fault: Fault) -> Self {
+        assert!(
+            self.device_faults.is_empty(),
+            "legacy operation faults cannot be mixed with device event faults"
+        );
         self.faults.push(fault);
         self
     }
     pub fn with_faults(mut self, faults: Vec<Fault>) -> Self {
+        assert!(
+            self.device_faults.is_empty(),
+            "legacy operation faults cannot be mixed with device event faults"
+        );
         self.faults.extend(faults);
         self
     }
@@ -180,7 +331,49 @@ impl SimDisk {
         self.op_index
     }
     pub fn virtual_time(&self) -> u64 {
-        self.virtual_time.load(Ordering::Relaxed)
+        self.clock
+            .lock()
+            .expect("device clock mutex poisoned")
+            .virtual_time
+    }
+    pub fn trace(&self) -> Vec<DeviceEvent> {
+        self.trace
+            .lock()
+            .expect("device trace mutex poisoned")
+            .clone()
+    }
+    pub fn add_bad_range(&mut self, offset: u64, len: usize) -> Result<(), DeviceError> {
+        self.bounds(offset, len)?;
+        self.bad_ranges.push((offset, len as u64));
+        Ok(())
+    }
+    pub fn try_with_device_faults(
+        mut self,
+        faults: Vec<DeviceFaultRule>,
+    ) -> Result<Self, DeviceError> {
+        if !self.faults.is_empty() {
+            return Err(DeviceError::InvalidConfig(
+                "legacy operation faults cannot be mixed with device event faults",
+            ));
+        }
+        for fault in faults {
+            fault.validate(self.len(), self.config.allow_torn_writes)?;
+            if self.device_faults.iter().any(|existing| {
+                existing.kind == fault.kind
+                    && existing.event_sequence == fault.event_sequence
+                    && ranges_overlap(existing.range, fault.range)
+            }) {
+                return Err(DeviceError::InvalidConfig(
+                    "device fault rules overlap at the same event",
+                ));
+            }
+            self.device_faults.push(fault);
+        }
+        Ok(self)
+    }
+    pub fn with_device_faults(self, faults: Vec<DeviceFaultRule>) -> Self {
+        self.try_with_device_faults(faults)
+            .expect("invalid device event fault rule")
     }
     pub fn try_new(len: usize, config: SimConfig) -> Result<Self, DeviceError> {
         config.clone().checked()?;
@@ -223,6 +416,15 @@ impl SimDisk {
         Ok(())
     }
     pub fn crash(&mut self) {
+        let (sequence, virtual_time) = self.begin_event(DeviceEventKind::Crash);
+        self.record_event(
+            sequence,
+            DeviceEventKind::Crash,
+            0,
+            0,
+            virtual_time,
+            DeviceEventOutcome::Completed,
+        );
         self.volatile.clone_from(&self.durable);
         self.pending.clear();
         self.flush_subset = None;
@@ -272,19 +474,19 @@ impl SimDisk {
         if crash {
             self.crash();
             return Err(DeviceError::Injected {
-                op,
+                at: InjectionSite::Operation(op),
                 kind: FaultKind::Crashed,
             });
         }
         if failed {
             return Err(DeviceError::Injected {
-                op,
+                at: InjectionSite::Operation(op),
                 kind: FaultKind::Failed,
             });
         }
         if timed_out {
             return Err(DeviceError::Injected {
-                op,
+                at: InjectionSite::Operation(op),
                 kind: FaultKind::Timeout,
             });
         }
@@ -341,12 +543,96 @@ impl SimDisk {
         // `volatile` already contains every issued write. Only crash resets it.
     }
 
-    fn add_latency(&self, ticks: u64) {
-        self.virtual_time
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
-                Some(now.saturating_add(ticks))
-            })
-            .expect("virtual time update cannot fail");
+    fn durable_prefix(&self, offset: u64, len: usize, requested: usize) -> usize {
+        let end = requested.min(len);
+        let mut cursor = 0;
+        while cursor < end {
+            let absolute_offset = offset as usize + cursor;
+            let unit_remaining =
+                self.config.atomic_write_size - absolute_offset % self.config.atomic_write_size;
+            let segment_len = unit_remaining.min(len - cursor);
+            if cursor + segment_len > end {
+                break;
+            }
+            cursor += segment_len;
+        }
+        cursor
+    }
+
+    fn latency(&self, kind: DeviceEventKind, sequence: u64) -> u64 {
+        let base = match kind {
+            DeviceEventKind::Read => self.config.latency.read_ticks,
+            DeviceEventKind::Write => self.config.latency.write_ticks,
+            DeviceEventKind::FlushData => self.config.latency.flush_data_ticks,
+            DeviceEventKind::FlushAll => self.config.latency.flush_all_ticks,
+            DeviceEventKind::Crash => 0,
+        };
+        let jitter = if self.config.latency.jitter_ticks == 0 {
+            0
+        } else {
+            let mut z = self.config.latency.seed ^ sequence.wrapping_mul(0x9e3779b97f4a7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            (z ^ (z >> 31)) % self.config.latency.jitter_ticks.saturating_add(1)
+        };
+        base.saturating_add(jitter)
+    }
+
+    fn begin_event(&self, kind: DeviceEventKind) -> (u64, u64) {
+        let mut clock = self.clock.lock().expect("device clock mutex poisoned");
+        let sequence = clock.next_sequence;
+        clock.next_sequence = clock
+            .next_sequence
+            .checked_add(1)
+            .expect("device event sequence exhausted");
+        clock.virtual_time = clock
+            .virtual_time
+            .saturating_add(self.latency(kind, sequence));
+        (sequence, clock.virtual_time)
+    }
+
+    fn record_event(
+        &self,
+        sequence: u64,
+        kind: DeviceEventKind,
+        offset: u64,
+        len: usize,
+        virtual_time: u64,
+        outcome: DeviceEventOutcome,
+    ) {
+        let mut trace = self.trace.lock().expect("device trace mutex poisoned");
+        trace.push(DeviceEvent {
+            sequence,
+            kind,
+            offset,
+            len,
+            virtual_time,
+            outcome,
+        });
+        trace.sort_by_key(|event| event.sequence);
+    }
+
+    fn overlaps_bad_range(&self, offset: u64, len: usize) -> bool {
+        let end = offset.saturating_add(len as u64);
+        self.bad_ranges.iter().any(|(bad_offset, bad_len)| {
+            let bad_end = bad_offset.saturating_add(*bad_len);
+            offset < bad_end && *bad_offset < end
+        })
+    }
+
+    fn device_fault(
+        &self,
+        kind: DeviceEventKind,
+        sequence: u64,
+        offset: u64,
+        len: usize,
+    ) -> Option<DeviceFaultAction> {
+        self.device_faults.iter().find_map(|rule| {
+            (rule.kind == kind
+                && rule.event_sequence == sequence
+                && rule.range.is_none_or(|range| range.intersects(offset, len)))
+            .then_some(rule.action)
+        })
     }
 
     fn apply_after_fault(&mut self, op: u64) -> Result<(), DeviceError> {
@@ -361,11 +647,21 @@ impl SimDisk {
         if crashed {
             self.crash();
             return Err(DeviceError::Injected {
-                op,
+                at: InjectionSite::Operation(op),
                 kind: FaultKind::Crashed,
             });
         }
         Ok(())
+    }
+}
+
+fn ranges_overlap(left: Option<ByteRange>, right: Option<ByteRange>) -> bool {
+    match (left, right) {
+        (None, _) | (_, None) => true,
+        (Some(left), Some(right)) => {
+            left.offset < right.offset.saturating_add(right.len)
+                && right.offset < left.offset.saturating_add(left.len)
+        }
     }
 }
 
@@ -380,7 +676,15 @@ impl Clone for SimDisk {
             faults: self.faults.clone(),
             flush_subset: self.flush_subset.clone(),
             flush_order: self.flush_order.clone(),
-            virtual_time: AtomicU64::new(self.virtual_time()),
+            clock: Mutex::new(*self.clock.lock().expect("device clock mutex poisoned")),
+            trace: Mutex::new(
+                self.trace
+                    .lock()
+                    .expect("device trace mutex poisoned")
+                    .clone(),
+            ),
+            bad_ranges: self.bad_ranges.clone(),
+            device_faults: self.device_faults.clone(),
         }
     }
 }
@@ -390,105 +694,401 @@ impl BlockDevice for SimDisk {
         self.durable.len() as u64
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
-        self.add_latency(self.config.latency.read_ticks);
-        let start = self.bounds(offset, buf.len())?;
-        for fault in &self.faults {
-            if let Fault::ReadFail {
-                offset: fault_offset,
-                len: fault_len,
-            } = fault
-            {
-                let request_end = offset.saturating_add(buf.len() as u64);
-                let fault_end = fault_offset.saturating_add(*fault_len);
-                if offset < fault_end && *fault_offset < request_end {
+        let (sequence, virtual_time) = self.begin_event(DeviceEventKind::Read);
+        let mut event_outcome = DeviceEventOutcome::Completed;
+        let result = (|| {
+            let start = self.bounds(offset, buf.len())?;
+            match self.device_fault(DeviceEventKind::Read, sequence, offset, buf.len()) {
+                None => {}
+                Some(DeviceFaultAction::Fail) => {
+                    event_outcome = DeviceEventOutcome::Failed;
                     return Err(DeviceError::Injected {
-                        op: self.op_index,
+                        at: InjectionSite::Event(sequence),
                         kind: FaultKind::ReadFailed,
                     });
                 }
+                Some(DeviceFaultAction::Timeout) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Timeout,
+                    });
+                }
+                Some(_) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::InvalidConfig("read fault action"));
+                }
+            }
+            if self.overlaps_bad_range(offset, buf.len()) {
+                event_outcome = DeviceEventOutcome::Failed;
+                return Err(DeviceError::Injected {
+                    at: InjectionSite::Event(sequence),
+                    kind: FaultKind::MediaError,
+                });
+            }
+            for fault in &self.faults {
+                if let Fault::ReadFail {
+                    offset: fault_offset,
+                    len: fault_len,
+                } = fault
+                {
+                    let request_end = offset.saturating_add(buf.len() as u64);
+                    let fault_end = fault_offset.saturating_add(*fault_len);
+                    if offset < fault_end && *fault_offset < request_end {
+                        event_outcome = DeviceEventOutcome::Failed;
+                        return Err(DeviceError::Injected {
+                            at: InjectionSite::Event(sequence),
+                            kind: FaultKind::ReadFailed,
+                        });
+                    }
+                }
+            }
+            buf.copy_from_slice(&self.volatile[start..start + buf.len()]);
+            Ok(())
+        })();
+        if result.is_err() {
+            if matches!(
+                result.as_ref(),
+                Err(DeviceError::Injected {
+                    kind: FaultKind::Crashed,
+                    ..
+                })
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+            } else if matches!(event_outcome, DeviceEventOutcome::Completed) {
+                event_outcome = DeviceEventOutcome::Failed;
             }
         }
-        buf.copy_from_slice(&self.volatile[start..start + buf.len()]);
-        Ok(())
+        self.record_event(
+            sequence,
+            DeviceEventKind::Read,
+            offset,
+            buf.len(),
+            virtual_time,
+            event_outcome,
+        );
+        result
     }
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
-        self.add_latency(self.config.latency.write_ticks);
-        let op = self.before()?;
-        let start = self.bounds(offset, buf.len())?;
-        let dropped = if let Some(index) = self
-            .faults
-            .iter()
-            .position(|fault| matches!(fault, Fault::DropWrite(n) if *n == op))
-        {
-            self.faults.remove(index);
-            true
-        } else {
-            false
-        };
-        if dropped {
-            return self.apply_after_fault(op);
-        }
-        let data = buf.to_vec();
-        let short_write = if let Some(index) = self.faults.iter().position(
-            |fault| matches!(fault, Fault::ShortWrite { op: fault_op, .. } if *fault_op == op),
-        ) {
-            let Fault::ShortWrite { bytes, .. } = self.faults.remove(index) else {
-                unreachable!("fault position matched ShortWrite")
-            };
-            let written = bytes.min(data.len());
-            self.volatile[start..start + written].copy_from_slice(&data[..written]);
+        let (sequence, virtual_time) = self.begin_event(DeviceEventKind::Write);
+        let mut event_outcome = DeviceEventOutcome::Completed;
+        let result = (|| {
+            let op = self.before()?;
+            let start = self.bounds(offset, buf.len())?;
+            let scripted = self.device_fault(DeviceEventKind::Write, sequence, offset, buf.len());
+            match scripted {
+                Some(DeviceFaultAction::CrashBefore) => {
+                    event_outcome = DeviceEventOutcome::Crashed;
+                    self.crash();
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Crashed,
+                    });
+                }
+                Some(DeviceFaultAction::Fail) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Failed,
+                    });
+                }
+                Some(DeviceFaultAction::Timeout) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Timeout,
+                    });
+                }
+                _ => {}
+            }
+            if self.overlaps_bad_range(offset, buf.len()) {
+                event_outcome = DeviceEventOutcome::Failed;
+                return Err(DeviceError::Injected {
+                    at: InjectionSite::Event(sequence),
+                    kind: FaultKind::MediaError,
+                });
+            }
+            let dropped = matches!(scripted, Some(DeviceFaultAction::Drop))
+                || if let Some(index) = self
+                    .faults
+                    .iter()
+                    .position(|fault| matches!(fault, Fault::DropWrite(n) if *n == op))
+                {
+                    self.faults.remove(index);
+                    true
+                } else {
+                    false
+                };
+            if dropped {
+                event_outcome = DeviceEventOutcome::Dropped;
+                let result = self.apply_after_fault(op);
+                if result.is_err() {
+                    event_outcome = DeviceEventOutcome::Crashed;
+                }
+                return result;
+            }
+            let data = buf.to_vec();
+            let legacy_short = self
+                .faults
+                .iter()
+                .position(|fault| {
+                    matches!(fault, Fault::ShortWrite { op: fault_op, .. } if *fault_op == op)
+                })
+                .map(|index| {
+                    let Fault::ShortWrite { bytes, .. } = self.faults.remove(index) else {
+                        unreachable!("fault position matched ShortWrite")
+                    };
+                    bytes
+                });
+            let scripted_short = matches!(scripted, Some(DeviceFaultAction::Short { .. }));
+            let short_write = match scripted {
+                Some(DeviceFaultAction::Short { bytes }) => Some(bytes),
+                _ => legacy_short,
+            }
+            .map(|bytes| {
+                let written = bytes.min(data.len());
+                self.volatile[start..start + written].copy_from_slice(&data[..written]);
+                self.pending.push(PendingWrite {
+                    operation_id: op,
+                    offset,
+                    data: data[..written].to_vec(),
+                    tear_prefix: None,
+                });
+                event_outcome = DeviceEventOutcome::Short { bytes: written };
+                DeviceError::Injected {
+                    at: if scripted_short {
+                        InjectionSite::Event(sequence)
+                    } else {
+                        InjectionSite::Operation(op)
+                    },
+                    kind: FaultKind::ShortIo,
+                }
+            });
+            if let Some(error) = short_write {
+                if self.apply_after_fault(op).is_err() {
+                    event_outcome = DeviceEventOutcome::Crashed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Operation(op),
+                        kind: FaultKind::Crashed,
+                    });
+                }
+                return Err(error);
+            }
+            let mut tear_prefix = None;
+            if let Some(DeviceFaultAction::Tear { durable_prefix }) = scripted {
+                if self.config.allow_torn_writes {
+                    tear_prefix = Some(durable_prefix);
+                }
+            }
+            if let Some(index) = self
+                .faults
+                .iter()
+                .position(|fault| matches!(fault, Fault::TearWrite { op: n, .. } if *n == op))
+            {
+                let Fault::TearWrite { durable_prefix, .. } = self.faults.remove(index) else {
+                    unreachable!("fault position matched TearWrite")
+                };
+                if self.config.allow_torn_writes {
+                    tear_prefix = Some(durable_prefix);
+                }
+            }
+            self.volatile[start..start + data.len()].copy_from_slice(&data);
             self.pending.push(PendingWrite {
                 operation_id: op,
                 offset,
-                data: data[..written].to_vec(),
-                tear_prefix: None,
+                data,
+                tear_prefix,
             });
-            Some(DeviceError::Injected {
-                op,
-                kind: FaultKind::ShortIo,
-            })
-        } else {
-            None
-        };
-        if let Some(error) = short_write {
+            if let Some(durable_prefix) = tear_prefix {
+                event_outcome = DeviceEventOutcome::Torn {
+                    durable_prefix: self.durable_prefix(offset, buf.len(), durable_prefix),
+                };
+            }
             self.apply_after_fault(op)?;
-            return Err(error);
-        }
-        let mut tear_prefix = None;
-        if let Some(index) = self
-            .faults
-            .iter()
-            .position(|fault| matches!(fault, Fault::TearWrite { op: n, .. } if *n == op))
-        {
-            let Fault::TearWrite { durable_prefix, .. } = self.faults.remove(index) else {
-                unreachable!("fault position matched TearWrite")
-            };
-            if self.config.allow_torn_writes {
-                tear_prefix = Some(durable_prefix);
+            if matches!(scripted, Some(DeviceFaultAction::CrashAfter)) {
+                event_outcome = DeviceEventOutcome::Crashed;
+                self.crash();
+                return Err(DeviceError::Injected {
+                    at: InjectionSite::Event(sequence),
+                    kind: FaultKind::Crashed,
+                });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            if matches!(
+                result.as_ref(),
+                Err(DeviceError::Injected {
+                    kind: FaultKind::Crashed,
+                    ..
+                })
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+            } else if matches!(event_outcome, DeviceEventOutcome::Completed) {
+                event_outcome = DeviceEventOutcome::Failed;
             }
         }
-        self.volatile[start..start + data.len()].copy_from_slice(&data);
-        self.pending.push(PendingWrite {
-            operation_id: op,
+        self.record_event(
+            sequence,
+            DeviceEventKind::Write,
             offset,
-            data,
-            tear_prefix,
-        });
-        self.apply_after_fault(op)
+            buf.len(),
+            virtual_time,
+            event_outcome,
+        );
+        result
     }
     fn flush_data(&mut self) -> Result<(), DeviceError> {
-        self.add_latency(self.config.latency.flush_data_ticks);
-        let op = self.before()?;
-        self.apply_pending();
-        self.apply_after_fault(op)
+        let (sequence, virtual_time) = self.begin_event(DeviceEventKind::FlushData);
+        let mut event_outcome = DeviceEventOutcome::Completed;
+        let result = (|| {
+            let op = self.before()?;
+            match self.device_fault(DeviceEventKind::FlushData, sequence, 0, 0) {
+                Some(DeviceFaultAction::CrashBefore) => {
+                    event_outcome = DeviceEventOutcome::Crashed;
+                    self.crash();
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Crashed,
+                    });
+                }
+                Some(DeviceFaultAction::Fail) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Failed,
+                    });
+                }
+                Some(DeviceFaultAction::Timeout) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Timeout,
+                    });
+                }
+                Some(DeviceFaultAction::Drop) => {
+                    event_outcome = DeviceEventOutcome::Dropped;
+                    self.apply_after_fault(op)?;
+                    return Ok(());
+                }
+                Some(DeviceFaultAction::CrashAfter) => {}
+                Some(_) => return Err(DeviceError::InvalidConfig("flush fault action")),
+                None => {}
+            }
+            self.apply_pending();
+            self.apply_after_fault(op)?;
+            if matches!(
+                self.device_fault(DeviceEventKind::FlushData, sequence, 0, 0),
+                Some(DeviceFaultAction::CrashAfter)
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+                self.crash();
+                return Err(DeviceError::Injected {
+                    at: InjectionSite::Event(sequence),
+                    kind: FaultKind::Crashed,
+                });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            if matches!(
+                result.as_ref(),
+                Err(DeviceError::Injected {
+                    kind: FaultKind::Crashed,
+                    ..
+                })
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+            } else if matches!(event_outcome, DeviceEventOutcome::Completed) {
+                event_outcome = DeviceEventOutcome::Failed;
+            }
+        }
+        self.record_event(
+            sequence,
+            DeviceEventKind::FlushData,
+            0,
+            0,
+            virtual_time,
+            event_outcome,
+        );
+        result
     }
     fn flush_all(&mut self) -> Result<(), DeviceError> {
-        self.add_latency(self.config.latency.flush_all_ticks);
-        let op = self.before()?;
-        self.flush_subset = None;
-        self.flush_order = None;
-        self.apply_pending();
-        self.apply_after_fault(op)
+        let (sequence, virtual_time) = self.begin_event(DeviceEventKind::FlushAll);
+        let mut event_outcome = DeviceEventOutcome::Completed;
+        let result = (|| {
+            let op = self.before()?;
+            match self.device_fault(DeviceEventKind::FlushAll, sequence, 0, 0) {
+                Some(DeviceFaultAction::CrashBefore) => {
+                    event_outcome = DeviceEventOutcome::Crashed;
+                    self.crash();
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Crashed,
+                    });
+                }
+                Some(DeviceFaultAction::Fail) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Failed,
+                    });
+                }
+                Some(DeviceFaultAction::Timeout) => {
+                    event_outcome = DeviceEventOutcome::Failed;
+                    return Err(DeviceError::Injected {
+                        at: InjectionSite::Event(sequence),
+                        kind: FaultKind::Timeout,
+                    });
+                }
+                Some(DeviceFaultAction::Drop) => {
+                    event_outcome = DeviceEventOutcome::Dropped;
+                    self.apply_after_fault(op)?;
+                    return Ok(());
+                }
+                Some(DeviceFaultAction::CrashAfter) => {}
+                Some(_) => return Err(DeviceError::InvalidConfig("flush fault action")),
+                None => {}
+            }
+            self.flush_subset = None;
+            self.flush_order = None;
+            self.apply_pending();
+            self.apply_after_fault(op)?;
+            if matches!(
+                self.device_fault(DeviceEventKind::FlushAll, sequence, 0, 0),
+                Some(DeviceFaultAction::CrashAfter)
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+                self.crash();
+                return Err(DeviceError::Injected {
+                    at: InjectionSite::Event(sequence),
+                    kind: FaultKind::Crashed,
+                });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            if matches!(
+                result.as_ref(),
+                Err(DeviceError::Injected {
+                    kind: FaultKind::Crashed,
+                    ..
+                })
+            ) {
+                event_outcome = DeviceEventOutcome::Crashed;
+            } else if matches!(event_outcome, DeviceEventOutcome::Completed) {
+                event_outcome = DeviceEventOutcome::Failed;
+            }
+        }
+        self.record_event(
+            sequence,
+            DeviceEventKind::FlushAll,
+            0,
+            0,
+            virtual_time,
+            event_outcome,
+        );
+        result
     }
 }
 
@@ -736,6 +1336,7 @@ mod tests {
                     write_ticks: 5,
                     flush_data_ticks: 7,
                     flush_all_ticks: 11,
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -750,6 +1351,224 @@ mod tests {
         assert_eq!(d.virtual_time(), 14);
         d.flush_all().unwrap();
         assert_eq!(d.virtual_time(), 25);
+    }
+
+    #[test]
+    fn device_trace_and_seeded_jitter_are_deterministic() {
+        let config = SimConfig {
+            latency: LatencyProfile {
+                read_ticks: 2,
+                write_ticks: 5,
+                flush_data_ticks: 7,
+                flush_all_ticks: 11,
+                jitter_ticks: 3,
+                seed: 41,
+            },
+            ..Default::default()
+        };
+        let mut first = SimDisk::new(16, config.clone());
+        let mut second = SimDisk::new(16, config);
+        for disk in [&mut first, &mut second] {
+            disk.write_at(2, b"abc").unwrap();
+            disk.flush_data().unwrap();
+            let mut byte = [0; 1];
+            disk.read_at(2, &mut byte).unwrap();
+            disk.crash();
+        }
+        assert_eq!(first.virtual_time(), second.virtual_time());
+        assert_eq!(first.trace(), second.trace());
+        assert_eq!(first.trace()[0].kind, DeviceEventKind::Write);
+        assert_eq!(first.trace()[0].offset, 2);
+        assert_eq!(first.trace()[0].len, 3);
+    }
+
+    #[test]
+    fn bad_ranges_are_persistent_physical_media_errors() {
+        let mut disk = SimDisk::new(16, SimConfig::default());
+        disk.add_bad_range(2, 2).unwrap();
+        assert!(matches!(
+            disk.write_at(0, b"abcd"),
+            Err(DeviceError::Injected {
+                kind: FaultKind::MediaError,
+                ..
+            })
+        ));
+        assert_eq!(disk.durable_bytes(), &[0; 16]);
+        assert!(matches!(
+            disk.read_at(2, &mut [0; 1]),
+            Err(DeviceError::Injected {
+                kind: FaultKind::MediaError,
+                ..
+            })
+        ));
+        disk.crash();
+        assert!(matches!(
+            disk.read_at(3, &mut [0; 1]),
+            Err(DeviceError::Injected {
+                kind: FaultKind::MediaError,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn device_fault_rules_match_events_and_physical_ranges() {
+        let mut disk =
+            SimDisk::new(16, SimConfig::default()).with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 2, len: 2 }),
+                action: DeviceFaultAction::Short { bytes: 2 },
+            }]);
+        assert!(matches!(
+            disk.write_at(0, b"abcd"),
+            Err(DeviceError::Injected {
+                at: InjectionSite::Event(0),
+                kind: FaultKind::ShortIo,
+                ..
+            })
+        ));
+        disk.flush_data().unwrap();
+        assert_eq!(&disk.durable_bytes()[..4], &[b'a', b'b', 0, 0]);
+        assert_eq!(disk.trace()[0].sequence, 0);
+        assert_eq!(disk.trace()[0].kind, DeviceEventKind::Write);
+        assert_eq!(
+            disk.trace()[0].outcome,
+            DeviceEventOutcome::Short { bytes: 2 }
+        );
+    }
+
+    #[test]
+    fn device_fault_rules_cover_persistence_and_crash_boundaries() {
+        let mut dropped =
+            SimDisk::new(8, SimConfig::default()).with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: None,
+                action: DeviceFaultAction::Drop,
+            }]);
+        dropped.write_at(0, b"x").unwrap();
+        dropped.flush_data().unwrap();
+        assert_eq!(dropped.durable_bytes()[0], 0);
+        assert_eq!(dropped.trace()[0].outcome, DeviceEventOutcome::Dropped);
+
+        let failed_read =
+            SimDisk::new(8, SimConfig::default()).with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Read,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 1, len: 1 }),
+                action: DeviceFaultAction::Fail,
+            }]);
+        assert!(matches!(
+            failed_read.read_at(1, &mut [0]),
+            Err(DeviceError::Injected {
+                kind: FaultKind::ReadFailed,
+                ..
+            })
+        ));
+
+        let mut crashed =
+            SimDisk::new(8, SimConfig::default()).with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::FlushData,
+                event_sequence: 1,
+                range: None,
+                action: DeviceFaultAction::CrashAfter,
+            }]);
+        crashed.write_at(0, b"x").unwrap();
+        assert!(matches!(
+            crashed.flush_data(),
+            Err(DeviceError::Injected {
+                kind: FaultKind::Crashed,
+                ..
+            })
+        ));
+        assert_eq!(crashed.durable_bytes()[0], b'x');
+        assert_eq!(crashed.trace()[1].outcome, DeviceEventOutcome::Crashed);
+    }
+
+    #[test]
+    fn device_fault_rules_are_validated_at_installation() {
+        let invalid_read =
+            SimDisk::new(8, SimConfig::default()).try_with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Read,
+                event_sequence: 0,
+                range: None,
+                action: DeviceFaultAction::Drop,
+            }]);
+        assert!(matches!(invalid_read, Err(DeviceError::InvalidConfig(_))));
+
+        let invalid_flush =
+            SimDisk::new(8, SimConfig::default()).try_with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::FlushData,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 0, len: 1 }),
+                action: DeviceFaultAction::Fail,
+            }]);
+        assert!(matches!(invalid_flush, Err(DeviceError::InvalidConfig(_))));
+
+        let invalid_tear =
+            SimDisk::new(8, SimConfig::default()).try_with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: None,
+                action: DeviceFaultAction::Tear { durable_prefix: 1 },
+            }]);
+        assert!(matches!(invalid_tear, Err(DeviceError::InvalidConfig(_))));
+
+        let invalid_range =
+            SimDisk::new(8, SimConfig::default()).try_with_device_faults(vec![DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 8, len: 1 }),
+                action: DeviceFaultAction::Fail,
+            }]);
+        assert!(matches!(invalid_range, Err(DeviceError::InvalidConfig(_))));
+
+        let overlapping = SimDisk::new(8, SimConfig::default()).try_with_device_faults(vec![
+            DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 0, len: 2 }),
+                action: DeviceFaultAction::Fail,
+            },
+            DeviceFaultRule {
+                kind: DeviceEventKind::Write,
+                event_sequence: 0,
+                range: Some(ByteRange { offset: 1, len: 2 }),
+                action: DeviceFaultAction::Timeout,
+            },
+        ]);
+        assert!(matches!(overlapping, Err(DeviceError::InvalidConfig(_))));
+
+        let mixed = SimDisk::new(8, SimConfig::default())
+            .with_fault(Fault::FailOp(0))
+            .try_with_device_faults(Vec::new());
+        assert!(matches!(mixed, Err(DeviceError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn torn_trace_reports_the_atomic_prefix_that_can_reach_media() {
+        let mut disk = SimDisk::new(
+            16,
+            SimConfig {
+                atomic_write_size: 4,
+                allow_torn_writes: true,
+                ..Default::default()
+            },
+        )
+        .with_device_faults(vec![DeviceFaultRule {
+            kind: DeviceEventKind::Write,
+            event_sequence: 0,
+            range: None,
+            action: DeviceFaultAction::Tear { durable_prefix: 2 },
+        }]);
+        disk.write_at(1, b"abcd").unwrap();
+        disk.flush_data().unwrap();
+        assert_eq!(
+            disk.trace()[0].outcome,
+            DeviceEventOutcome::Torn { durable_prefix: 0 }
+        );
+        assert_eq!(&disk.durable_bytes()[1..5], &[0; 4]);
     }
 
     #[test]
@@ -805,6 +1624,7 @@ mod tests {
         assert!(matches!(
             short.write_at(0, b"abcd"),
             Err(DeviceError::Injected {
+                at: InjectionSite::Operation(0),
                 kind: FaultKind::ShortIo,
                 ..
             })

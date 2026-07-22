@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod replay;
+pub mod state_machine;
 
 use std::collections::{HashMap, HashSet};
 

@@ -63,6 +63,10 @@ pub struct LatencySpec {
     pub flush_data_ticks: u64,
     #[serde(default)]
     pub flush_all_ticks: u64,
+    #[serde(default)]
+    pub jitter_ticks: u64,
+    #[serde(default)]
+    pub seed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -154,9 +158,61 @@ pub enum ReplayError {
     InvalidCase(String),
     Decode(String),
     Encode(String),
-    Divergence { step: usize, detail: String },
-    Core(String),
+    Divergence {
+        step: usize,
+        kind: DivergenceKind,
+        detail: String,
+    },
+    Core {
+        kind: CoreFailureKind,
+        device: Option<DeviceFailureKind>,
+        detail: String,
+    },
     UntriggeredCrash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DivergenceKind {
+    ChunkIds,
+    OracleChunkId,
+    ModelRejectedChunk,
+    CoreRejectedChunk,
+    ManifestIds,
+    OracleManifestId,
+    ModelRejectedManifest,
+    CoreRejectedManifest,
+    ModelRejectedRoot,
+    CoreRejectedRoot,
+    OracleStepOutcome,
+    UnexpectedRejection,
+    RejectionReasons,
+    ModelPlanningChunk,
+    ModelPlanningManifest,
+    RootValues,
+    OracleRootMissing,
+    OracleRootValues,
+    RecoveredRoots,
+    RecoveredChunkVisibility,
+    RecoveredManifestVisibility,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreFailureKind {
+    Format,
+    Reopen,
+    FinalReportReopen,
+    ReadAfterRecovery,
+    ManifestProbeOpen,
+    ManifestProbe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceFailureKind {
+    OutOfBounds,
+    InvalidConfig,
+    Io,
+    Injected(cairn_device::FaultKind),
 }
 
 impl fmt::Display for ReplayError {
@@ -165,10 +221,10 @@ impl fmt::Display for ReplayError {
             Self::InvalidCase(detail) => write!(f, "invalid replay case: {detail}"),
             Self::Decode(detail) => write!(f, "replay decode failed: {detail}"),
             Self::Encode(detail) => write!(f, "replay encode failed: {detail}"),
-            Self::Divergence { step, detail } => {
+            Self::Divergence { step, detail, .. } => {
                 write!(f, "core/model divergence at step {step}: {detail}")
             }
-            Self::Core(detail) => write!(f, "core recovery failed: {detail}"),
+            Self::Core { detail, .. } => write!(f, "core recovery failed: {detail}"),
             Self::UntriggeredCrash => write!(f, "configured crash point was not triggered"),
         }
     }
@@ -347,6 +403,8 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
             write_ticks: case.disk.latency.write_ticks,
             flush_data_ticks: case.disk.latency.flush_data_ticks,
             flush_all_ticks: case.disk.latency.flush_all_ticks,
+            jitter_ticks: case.disk.latency.jitter_ticks,
+            seed: case.disk.latency.seed,
         },
     };
     let disk = SimDisk::new(case.disk.capacity_bytes as usize, config);
@@ -356,7 +414,11 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
         None => disk,
         _ => unreachable!("resolve_fault only returns crash faults"),
     };
-    let mut core = Store::format(disk).map_err(|error| ReplayError::Core(format!("{error:?}")))?;
+    let mut core = Store::format(disk).map_err(|error| ReplayError::Core {
+        kind: CoreFailureKind::Format,
+        device: device_failure_kind(&error),
+        detail: format!("{error:?}"),
+    })?;
     let mut model = Model::default();
     let mut chunk_slots = HashMap::<u8, [u8; 32]>::new();
     let mut manifest_slots = HashMap::<u8, [u8; 32]>::new();
@@ -501,8 +563,11 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
                 let mut device = device;
                 device.crash();
                 let probe_device = device.clone();
-                core = Store::open(device)
-                    .map_err(|error| ReplayError::Core(format!("reopen failed: {error:?}")))?;
+                core = Store::open(device).map_err(|error| ReplayError::Core {
+                    kind: CoreFailureKind::Reopen,
+                    device: device_failure_kind(&error),
+                    detail: format!("reopen failed: {error:?}"),
+                })?;
                 compare_visible_state(index, &mut core, &oracle.snapshot, &probe_device)?;
                 recovery_required = false;
                 StepOutcome::Reopened
@@ -527,8 +592,11 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
         return Err(ReplayError::UntriggeredCrash);
     }
     let device = core.into_device();
-    let recovered = Store::open(device)
-        .map_err(|error| ReplayError::Core(format!("final report reopen failed: {error:?}")))?;
+    let recovered = Store::open(device).map_err(|error| ReplayError::Core {
+        kind: CoreFailureKind::FinalReportReopen,
+        device: device_failure_kind(&error),
+        detail: format!("final report reopen failed: {error:?}"),
+    })?;
     let recovered_root = recovered.current_root().map(root_report);
     let device = recovered.into_device();
     Ok(ReplayReport {
@@ -827,9 +895,11 @@ fn compare_visible_state(
             Ok(bytes) => Some(bytes),
             Err(CoreError::NotFound(_)) => None,
             Err(error) => {
-                return Err(ReplayError::Core(format!(
-                    "read after recovery failed: {error:?}"
-                )))
+                return Err(ReplayError::Core {
+                    kind: CoreFailureKind::ReadAfterRecovery,
+                    device: device_failure_kind(&error),
+                    detail: format!("read after recovery failed: {error:?}"),
+                })
             }
         };
         let oracle_bytes = oracle.visible_chunks.get(id).map(Vec::as_slice);
@@ -882,17 +952,22 @@ fn probe_manifest(
     manifest: [u8; 32],
     generation: u64,
 ) -> Result<ManifestVisibility, ReplayError> {
-    let mut probe = Store::open(device.clone())
-        .map_err(|error| ReplayError::Core(format!("manifest probe open failed: {error:?}")))?;
+    let mut probe = Store::open(device.clone()).map_err(|error| ReplayError::Core {
+        kind: CoreFailureKind::ManifestProbeOpen,
+        device: device_failure_kind(&error),
+        detail: format!("manifest probe open failed: {error:?}"),
+    })?;
     match probe.commit_root(manifest, generation) {
         Ok(_) => Ok(ManifestVisibility::Valid),
         Err(CoreError::NotFound(id)) if id == manifest => Ok(ManifestVisibility::Hidden),
         Err(CoreError::NotFound(_)) | Err(CoreError::Corruption(_)) => {
             Ok(ManifestVisibility::Invalid)
         }
-        Err(error) => Err(ReplayError::Core(format!(
-            "manifest probe failed: {error:?}"
-        ))),
+        Err(error) => Err(ReplayError::Core {
+            kind: CoreFailureKind::ManifestProbe,
+            device: device_failure_kind(&error),
+            detail: format!("manifest probe failed: {error:?}"),
+        }),
     }
 }
 
@@ -913,9 +988,63 @@ fn is_injected_crash<T>(result: &Result<T, CoreError>) -> bool {
     )
 }
 
+fn device_failure_kind(error: &CoreError) -> Option<DeviceFailureKind> {
+    match error {
+        CoreError::Device(DeviceError::OutOfBounds { .. }) => Some(DeviceFailureKind::OutOfBounds),
+        CoreError::Device(DeviceError::InvalidConfig(_)) => Some(DeviceFailureKind::InvalidConfig),
+        CoreError::Device(DeviceError::Io { .. }) => Some(DeviceFailureKind::Io),
+        CoreError::Device(DeviceError::Injected { kind, .. }) => {
+            Some(DeviceFailureKind::Injected(*kind))
+        }
+        _ => None,
+    }
+}
+
 fn divergence(step: usize, detail: &str) -> ReplayError {
     ReplayError::Divergence {
         step,
+        kind: match detail {
+            "chunk IDs differ" => DivergenceKind::ChunkIds,
+            "oracle chunk ID differs" => DivergenceKind::OracleChunkId,
+            "manifest IDs differ" => DivergenceKind::ManifestIds,
+            "oracle manifest ID differs" => DivergenceKind::OracleManifestId,
+            "root values differ" => DivergenceKind::RootValues,
+            "oracle did not publish an accepted root" => DivergenceKind::OracleRootMissing,
+            "oracle root values differ" => DivergenceKind::OracleRootValues,
+            "recovered roots differ" => DivergenceKind::RecoveredRoots,
+            "recovered chunk visibility differs" => DivergenceKind::RecoveredChunkVisibility,
+            "recovered manifest visibility differs" => DivergenceKind::RecoveredManifestVisibility,
+            detail if detail.starts_with("model rejected chunk:") => {
+                DivergenceKind::ModelRejectedChunk
+            }
+            detail if detail.starts_with("core rejected chunk:") => {
+                DivergenceKind::CoreRejectedChunk
+            }
+            detail if detail.starts_with("model rejected manifest:") => {
+                DivergenceKind::ModelRejectedManifest
+            }
+            detail if detail.starts_with("core rejected manifest:") => {
+                DivergenceKind::CoreRejectedManifest
+            }
+            detail if detail.starts_with("model rejected root:") => {
+                DivergenceKind::ModelRejectedRoot
+            }
+            detail if detail.starts_with("core rejected root:") => DivergenceKind::CoreRejectedRoot,
+            detail if detail.starts_with("oracle expected") => DivergenceKind::OracleStepOutcome,
+            detail if detail.starts_with("core returned an unexpected rejection:") => {
+                DivergenceKind::UnexpectedRejection
+            }
+            detail if detail.starts_with("rejection reasons differ:") => {
+                DivergenceKind::RejectionReasons
+            }
+            detail if detail.starts_with("model planning chunk failed:") => {
+                DivergenceKind::ModelPlanningChunk
+            }
+            detail if detail.starts_with("model planning manifest failed:") => {
+                DivergenceKind::ModelPlanningManifest
+            }
+            _ => DivergenceKind::Other,
+        },
         detail: detail.into(),
     }
 }
