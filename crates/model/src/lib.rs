@@ -1,3 +1,10 @@
+pub mod dag;
+
+pub use dag::{
+    content_digest, decode_node, encode_node_payload, node_id, CommitNode, ContentNode, Dag,
+    DagError, Node, NodeId, NodeKind, RangeMapEntry, RangeMapNode, SnapshotNode, ZeroRunNode,
+};
+
 use std::collections::HashMap;
 
 pub type ObjectId = [u8; 32];
