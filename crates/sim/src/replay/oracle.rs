@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use super::{CrashTiming, MutationPhase, RejectionReason, ReplayCase, StepOutcome, StoreOp};
+use super::{RejectionReason, ReplayCase, StepOutcome, StoreOp};
 
 type ObjectId = [u8; 32];
 
@@ -12,6 +12,8 @@ const MANIFEST_DOMAIN: &[u8] = b"cairn/manifest/v1\0";
 pub(crate) struct OraclePlan {
     pub(crate) steps: Vec<OracleStep>,
     pub(crate) snapshot: OracleSnapshot,
+    pub(crate) before_snapshots: Vec<OracleSnapshot>,
+    pub(crate) after_snapshots: Vec<OracleSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,58 +71,21 @@ impl fmt::Display for OracleError {
 impl OraclePlan {
     pub(crate) fn from_case(case: &ReplayCase) -> Result<Self, OracleError> {
         let mut state = OracleState::default();
-        let crash = case.crash.as_ref();
         let mut steps = Vec::with_capacity(case.operations.len());
+        let mut before_snapshots = Vec::with_capacity(case.operations.len());
+        let mut after_snapshots = Vec::with_capacity(case.operations.len());
 
-        for (step, operation) in case.operations.iter().enumerate() {
-            if crash.is_some_and(|point| usize::from(point.step) == step) {
-                let point = crash.expect("checked above");
-                let mutations = state.mutation_count(operation)?;
-                let phase = phase_index(operation, point.phase).ok_or_else(|| {
-                    OracleError(format!(
-                        "crash phase does not apply to operation at step {step}"
-                    ))
-                })?;
-                if mutations == 0 || phase >= mutations {
-                    return Err(OracleError(format!(
-                        "crash point targets an operation with no mutation at step {step}"
-                    )));
-                }
-
-                let before = state.clone();
-                let execution = state.execute(operation)?;
-                if !matches!(execution.outcome, StepOutcome::Accepted) {
-                    return Err(OracleError(format!(
-                        "crash target was not accepted at step {step}"
-                    )));
-                }
-                let publishes = matches!(
-                    (operation, point.phase, point.timing),
-                    (
-                        StoreOp::CommitRoot { .. },
-                        MutationPhase::SuperblockFlush,
-                        CrashTiming::After
-                    )
-                );
-                if !publishes {
-                    let known_chunks = state.known_chunks.clone();
-                    let known_manifests = state.known_manifests.clone();
-                    state = before;
-                    state.known_chunks = known_chunks;
-                    state.known_manifests = known_manifests;
-                }
-                steps.push(OracleStep {
-                    outcome: StepOutcome::InjectedCrash,
-                    ..execution
-                });
-            } else {
-                steps.push(state.execute(operation)?);
-            }
+        for operation in &case.operations {
+            before_snapshots.push(state.snapshot());
+            steps.push(state.execute(operation)?);
+            after_snapshots.push(state.snapshot());
         }
 
         Ok(Self {
             steps,
             snapshot: state.snapshot(),
+            before_snapshots,
+            after_snapshots,
         })
     }
 }
@@ -226,72 +191,14 @@ impl OracleState {
         }
     }
 
-    fn mutation_count(&self, operation: &StoreOp) -> Result<usize, OracleError> {
-        match operation {
-            StoreOp::PutChunk { bytes, .. } => {
-                let id = chunk_id(bytes);
-                Ok(
-                    if self.pending_chunks.contains_key(&id)
-                        || self.visible_chunks.contains_key(&id)
-                    {
-                        0
-                    } else {
-                        3
-                    },
-                )
-            }
-            StoreOp::PutManifest { chunks, .. } => {
-                for chunk in chunks {
-                    if !self.chunk_slots.contains_key(&chunk.chunk_slot) {
-                        return Err(OracleError(format!(
-                            "unknown chunk slot {}",
-                            chunk.chunk_slot
-                        )));
-                    }
-                }
-                Ok(3)
-            }
-            StoreOp::CommitRoot { .. } => {
-                let mut candidate = self.clone();
-                Ok(
-                    if matches!(candidate.execute(operation)?.outcome, StepOutcome::Accepted) {
-                        5
-                    } else {
-                        0
-                    },
-                )
-            }
-            StoreOp::CrashReopen => Ok(0),
-        }
-    }
-
-    fn snapshot(self) -> OracleSnapshot {
+    fn snapshot(&self) -> OracleSnapshot {
         OracleSnapshot {
             root: self.root,
-            known_chunks: self.known_chunks,
-            visible_chunks: self.visible_chunks,
-            known_manifests: self.known_manifests,
-            visible_manifests: self.visible_manifests,
+            known_chunks: self.known_chunks.clone(),
+            visible_chunks: self.visible_chunks.clone(),
+            known_manifests: self.known_manifests.clone(),
+            visible_manifests: self.visible_manifests.clone(),
         }
-    }
-}
-
-fn phase_index(operation: &StoreOp, phase: MutationPhase) -> Option<usize> {
-    match operation {
-        StoreOp::PutChunk { .. } | StoreOp::PutManifest { .. } => match phase {
-            MutationPhase::RecordHeaderWrite => Some(0),
-            MutationPhase::RecordPayloadWrite => Some(1),
-            MutationPhase::RecordFlush => Some(2),
-            MutationPhase::SuperblockWrite | MutationPhase::SuperblockFlush => None,
-        },
-        StoreOp::CommitRoot { .. } => match phase {
-            MutationPhase::RecordHeaderWrite => Some(0),
-            MutationPhase::RecordPayloadWrite => Some(1),
-            MutationPhase::RecordFlush => Some(2),
-            MutationPhase::SuperblockWrite => Some(3),
-            MutationPhase::SuperblockFlush => Some(4),
-        },
-        StoreOp::CrashReopen => None,
     }
 }
 

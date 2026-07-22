@@ -4,7 +4,7 @@ use std::fmt;
 use cairn_core::{
     ChunkRef as CoreChunkRef, Error as CoreError, Root as CoreRoot, Store, RECORDS_START,
 };
-use cairn_device::{DeviceError, Fault, LatencyProfile, SimConfig, SimDisk};
+use cairn_device::{DeviceError, DeviceEvent, DeviceRule, DeviceScript, SimDisk};
 use cairn_model::{ChunkRef as ModelChunkRef, Model};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,6 @@ const MAX_SLOTS: usize = 32;
 const MAX_PAYLOAD: usize = 4 * 1024;
 const MAX_TOTAL_PAYLOAD: usize = 64 * 1024;
 const MAX_MANIFEST_CHUNKS: usize = 8;
-const FORMAT_MUTATIONS: u64 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -31,8 +30,6 @@ pub struct ReplayCase {
     pub seed: Option<u64>,
     pub disk: DiskSpec,
     pub operations: Vec<StoreOp>,
-    #[serde(default)]
-    pub crash: Option<CrashPoint>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -40,33 +37,16 @@ pub struct ReplayCase {
 pub struct DiskSpec {
     pub capacity_bytes: u32,
     #[serde(default)]
-    pub latency: LatencySpec,
+    pub script: DeviceScript,
 }
 
 impl Default for DiskSpec {
     fn default() -> Self {
         Self {
             capacity_bytes: 256 * 1024,
-            latency: LatencySpec::default(),
+            script: DeviceScript::default(),
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LatencySpec {
-    #[serde(default)]
-    pub read_ticks: u64,
-    #[serde(default)]
-    pub write_ticks: u64,
-    #[serde(default)]
-    pub flush_data_ticks: u64,
-    #[serde(default)]
-    pub flush_all_ticks: u64,
-    #[serde(default)]
-    pub jitter_ticks: u64,
-    #[serde(default)]
-    pub seed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -85,41 +65,14 @@ pub struct ChunkSpec {
     pub len: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct CrashPoint {
-    pub step: u16,
-    pub phase: MutationPhase,
-    pub timing: CrashTiming,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MutationPhase {
-    RecordHeaderWrite,
-    RecordPayloadWrite,
-    RecordFlush,
-    SuperblockWrite,
-    SuperblockFlush,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CrashTiming {
-    Before,
-    After,
-}
-
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct ReplayReport {
     pub version: u16,
     pub steps: Vec<StepReport>,
     pub recovered_root: Option<RootReport>,
-    pub resolved_fault_op: Option<u64>,
     pub durable_digest: [u8; 32],
     pub pending_writes: usize,
-    pub op_index: u64,
-    pub faults_remaining: usize,
+    pub device_events: usize,
     pub virtual_time: u64,
 }
 
@@ -168,7 +121,6 @@ pub enum ReplayError {
         device: Option<DeviceFailureKind>,
         detail: String,
     },
-    UntriggeredCrash,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +177,6 @@ impl fmt::Display for ReplayError {
                 write!(f, "core/model divergence at step {step}: {detail}")
             }
             Self::Core { detail, .. } => write!(f, "core recovery failed: {detail}"),
-            Self::UntriggeredCrash => write!(f, "configured crash point was not triggered"),
         }
     }
 }
@@ -267,19 +218,6 @@ impl ReplayCase {
                 "crash_reopen may only appear as the final operation".into(),
             ));
         }
-        if self.crash.as_ref().is_some_and(|point| {
-            usize::from(point.step) >= self.operations.len() - 1
-                || matches!(
-                    self.operations[usize::from(point.step)],
-                    StoreOp::CrashReopen
-                )
-                || usize::from(point.step) + 1 != self.operations.len() - 1
-        }) {
-            return Err(ReplayError::InvalidCase(
-                "crash point must target the operation immediately before crash_reopen".into(),
-            ));
-        }
-
         let mut slots = HashSet::new();
         let mut defined_chunks = HashSet::new();
         let mut defined_manifests = HashSet::new();
@@ -362,6 +300,8 @@ impl ReplayCase {
                 self.disk.capacity_bytes
             )));
         }
+        SimDisk::from_script(self.disk.capacity_bytes as usize, self.disk.script.clone())
+            .map_err(|error| ReplayError::InvalidCase(format!("invalid device script: {error}")))?;
         OraclePlan::from_case(self).map_err(|error| ReplayError::InvalidCase(error.to_string()))?;
         Ok(())
     }
@@ -392,224 +332,248 @@ pub fn replay(case: &ReplayCase) -> Result<ReplayReport, ReplayError> {
     case.validate()?;
     let oracle =
         OraclePlan::from_case(case).map_err(|error| ReplayError::InvalidCase(error.to_string()))?;
-    let fault = resolve_fault(case)?;
-    let resolved_fault_op = fault.as_ref().map(fault_operation);
-    let config = SimConfig {
-        atomic_write_size: 1,
-        allow_reordering: false,
-        allow_torn_writes: false,
-        latency: LatencyProfile {
-            read_ticks: case.disk.latency.read_ticks,
-            write_ticks: case.disk.latency.write_ticks,
-            flush_data_ticks: case.disk.latency.flush_data_ticks,
-            flush_all_ticks: case.disk.latency.flush_all_ticks,
-            jitter_ticks: case.disk.latency.jitter_ticks,
-            seed: case.disk.latency.seed,
-        },
-    };
-    let disk = SimDisk::new(case.disk.capacity_bytes as usize, config);
-    let disk = match fault {
-        Some(Fault::CrashBeforeOp(op)) => disk.with_fault(Fault::CrashBeforeOp(op)),
-        Some(Fault::CrashAfterOp(op)) => disk.with_fault(Fault::CrashAfterOp(op)),
-        None => disk,
-        _ => unreachable!("resolve_fault only returns crash faults"),
-    };
-    let mut core = Store::format(disk).map_err(|error| ReplayError::Core {
-        kind: CoreFailureKind::Format,
-        device: device_failure_kind(&error),
-        detail: format!("{error:?}"),
-    })?;
-    let mut model = Model::default();
-    let mut chunk_slots = HashMap::<u8, [u8; 32]>::new();
-    let mut manifest_slots = HashMap::<u8, [u8; 32]>::new();
-    let mut reports = Vec::with_capacity(case.operations.len());
-    let mut fault_triggered = false;
-    let mut recovery_required = false;
+    let disk = SimDisk::from_script(case.disk.capacity_bytes as usize, case.disk.script.clone())
+        .map_err(|error| ReplayError::InvalidCase(format!("invalid device script: {error}")))?;
+    let rule_hits = disk.script_rule_hits();
+    let result = (|| {
+        let mut core = Store::format(disk).map_err(|error| ReplayError::Core {
+            kind: CoreFailureKind::Format,
+            device: device_failure_kind(&error),
+            detail: format!("{error:?}"),
+        })?;
+        let mut model = Model::default();
+        let mut chunk_slots = HashMap::<u8, [u8; 32]>::new();
+        let mut manifest_slots = HashMap::<u8, [u8; 32]>::new();
+        let mut reports = Vec::with_capacity(case.operations.len());
+        let mut recovery_required = false;
+        let mut injected_crash = false;
 
-    for (index, operation) in case.operations.iter().enumerate() {
-        if recovery_required && !matches!(operation, StoreOp::CrashReopen) {
-            return Err(ReplayError::InvalidCase(
-                "only crash_reopen is allowed after an injected crash".into(),
-            ));
+        for (index, operation) in case.operations.iter().enumerate() {
+            if recovery_required && !matches!(operation, StoreOp::CrashReopen) {
+                return Err(ReplayError::InvalidCase(
+                    "only crash_reopen is allowed after an injected crash".into(),
+                ));
+            }
+            let outcome = match operation {
+                StoreOp::PutChunk { slot, bytes } => {
+                    let core_result = core.put_bytes(bytes);
+                    if is_injected_crash(&core_result) {
+                        recovery_required = true;
+                        StepOutcome::InjectedCrash
+                    } else {
+                        let model_result = model.put_bytes(bytes.clone());
+                        match (core_result, model_result) {
+                            (Ok(core_id), Ok(model_id)) => {
+                                if core_id != model_id {
+                                    return Err(divergence(index, "chunk IDs differ"));
+                                }
+                                if oracle.steps[index].chunk_id != Some(core_id) {
+                                    return Err(divergence(index, "oracle chunk ID differs"));
+                                }
+                                chunk_slots.insert(*slot, core_id);
+                                StepOutcome::Accepted
+                            }
+                            (Err(core_error), Err(model_error)) => compare_rejections(
+                                index,
+                                &core_error,
+                                &model_error,
+                                RejectionContext::PutChunk,
+                            )?,
+                            (Ok(_), Err(error)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("model rejected chunk: {error:?}"),
+                                ))
+                            }
+                            (Err(error), Ok(_)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("core rejected chunk: {error:?}"),
+                                ))
+                            }
+                        }
+                    }
+                }
+                StoreOp::PutManifest { slot, chunks } => {
+                    let core_chunks = resolve_core_chunks(index, chunks, &chunk_slots)?;
+                    let model_chunks = resolve_model_chunks(index, chunks, &chunk_slots)?;
+                    let core_result = core.put_manifest(&core_chunks);
+                    if is_injected_crash(&core_result) {
+                        recovery_required = true;
+                        StepOutcome::InjectedCrash
+                    } else {
+                        let model_result = model.put_manifest(&model_chunks);
+                        match (core_result, model_result) {
+                            (Ok(core_id), Ok(model_id)) => {
+                                if core_id != model_id {
+                                    return Err(divergence(index, "manifest IDs differ"));
+                                }
+                                if oracle.steps[index].manifest_id != Some(core_id) {
+                                    return Err(divergence(index, "oracle manifest ID differs"));
+                                }
+                                manifest_slots.insert(*slot, core_id);
+                                StepOutcome::Accepted
+                            }
+                            (Err(core_error), Err(model_error)) => compare_rejections(
+                                index,
+                                &core_error,
+                                &model_error,
+                                RejectionContext::PutManifest,
+                            )?,
+                            (Ok(_), Err(error)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("model rejected manifest: {error:?}"),
+                                ))
+                            }
+                            (Err(error), Ok(_)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("core rejected manifest: {error:?}"),
+                                ))
+                            }
+                        }
+                    }
+                }
+                StoreOp::CommitRoot {
+                    manifest_slot,
+                    generation,
+                } => {
+                    let manifest = *manifest_slots.get(manifest_slot).ok_or_else(|| {
+                        ReplayError::InvalidCase(format!(
+                            "step {index} references unknown manifest slot {manifest_slot}"
+                        ))
+                    })?;
+                    let core_result = core.commit_root(manifest, *generation);
+                    if is_injected_crash(&core_result) {
+                        recovery_required = true;
+                        StepOutcome::InjectedCrash
+                    } else {
+                        let model_result = model.commit_root(manifest, *generation);
+                        match (core_result, model_result) {
+                            (Ok(core_root), Ok(model_root)) => {
+                                compare_roots(index, &core_root, &model_root)?;
+                                compare_oracle_root(index, &core_root, oracle.steps[index].root)?;
+                                StepOutcome::Accepted
+                            }
+                            (Err(core_error), Err(model_error)) => compare_rejections(
+                                index,
+                                &core_error,
+                                &model_error,
+                                RejectionContext::CommitRoot,
+                            )?,
+                            (Ok(_), Err(error)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("model rejected root: {error:?}"),
+                                ))
+                            }
+                            (Err(error), Ok(_)) => {
+                                return Err(divergence(
+                                    index,
+                                    &format!("core rejected root: {error:?}"),
+                                ))
+                            }
+                        }
+                    }
+                }
+                StoreOp::CrashReopen => {
+                    let device = core.into_device();
+                    let mut device = device;
+                    device.power_loss();
+                    let probe_device = device.clone();
+                    core = Store::open(device).map_err(|error| ReplayError::Core {
+                        kind: CoreFailureKind::Reopen,
+                        device: device_failure_kind(&error),
+                        detail: format!("reopen failed: {error:?}"),
+                    })?;
+                    let expected_snapshot = if injected_crash {
+                        recovery_snapshot_after_device_crash(case, &oracle, index, &probe_device)?
+                    } else {
+                        oracle.snapshot.clone()
+                    };
+                    compare_visible_state(index, &mut core, &expected_snapshot, &probe_device)?;
+                    recovery_required = false;
+                    injected_crash = false;
+                    StepOutcome::Reopened
+                }
+            };
+            if outcome == StepOutcome::InjectedCrash {
+                // The device script is the oracle for faulted I/O. The logical
+                // oracle intentionally remains fault-free; recovery is checked by
+                // the device trace and the subsequent reopen itself.
+                injected_crash = true;
+            } else if outcome != oracle.steps[index].outcome {
+                return Err(divergence(
+                    index,
+                    &format!(
+                        "oracle expected {:?}, execution returned {:?}",
+                        oracle.steps[index].outcome, outcome
+                    ),
+                ));
+            }
+            reports.push(StepReport {
+                step: index as u16,
+                outcome,
+            });
         }
-        let outcome = match operation {
-            StoreOp::PutChunk { slot, bytes } => {
-                let core_result = core.put_bytes(bytes);
-                if is_injected_crash(&core_result) {
-                    fault_triggered = true;
-                    recovery_required = true;
-                    StepOutcome::InjectedCrash
-                } else {
-                    let model_result = model.put_bytes(bytes.clone());
-                    match (core_result, model_result) {
-                        (Ok(core_id), Ok(model_id)) => {
-                            if core_id != model_id {
-                                return Err(divergence(index, "chunk IDs differ"));
-                            }
-                            if oracle.steps[index].chunk_id != Some(core_id) {
-                                return Err(divergence(index, "oracle chunk ID differs"));
-                            }
-                            chunk_slots.insert(*slot, core_id);
-                            StepOutcome::Accepted
-                        }
-                        (Err(core_error), Err(model_error)) => compare_rejections(
-                            index,
-                            &core_error,
-                            &model_error,
-                            RejectionContext::PutChunk,
-                        )?,
-                        (Ok(_), Err(error)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("model rejected chunk: {error:?}"),
-                            ))
-                        }
-                        (Err(error), Ok(_)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("core rejected chunk: {error:?}"),
-                            ))
-                        }
-                    }
-                }
-            }
-            StoreOp::PutManifest { slot, chunks } => {
-                let core_chunks = resolve_core_chunks(index, chunks, &chunk_slots)?;
-                let model_chunks = resolve_model_chunks(index, chunks, &chunk_slots)?;
-                let core_result = core.put_manifest(&core_chunks);
-                if is_injected_crash(&core_result) {
-                    fault_triggered = true;
-                    recovery_required = true;
-                    StepOutcome::InjectedCrash
-                } else {
-                    let model_result = model.put_manifest(&model_chunks);
-                    match (core_result, model_result) {
-                        (Ok(core_id), Ok(model_id)) => {
-                            if core_id != model_id {
-                                return Err(divergence(index, "manifest IDs differ"));
-                            }
-                            if oracle.steps[index].manifest_id != Some(core_id) {
-                                return Err(divergence(index, "oracle manifest ID differs"));
-                            }
-                            manifest_slots.insert(*slot, core_id);
-                            StepOutcome::Accepted
-                        }
-                        (Err(core_error), Err(model_error)) => compare_rejections(
-                            index,
-                            &core_error,
-                            &model_error,
-                            RejectionContext::PutManifest,
-                        )?,
-                        (Ok(_), Err(error)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("model rejected manifest: {error:?}"),
-                            ))
-                        }
-                        (Err(error), Ok(_)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("core rejected manifest: {error:?}"),
-                            ))
-                        }
-                    }
-                }
-            }
-            StoreOp::CommitRoot {
-                manifest_slot,
-                generation,
-            } => {
-                let manifest = *manifest_slots.get(manifest_slot).ok_or_else(|| {
-                    ReplayError::InvalidCase(format!(
-                        "step {index} references unknown manifest slot {manifest_slot}"
-                    ))
-                })?;
-                let core_result = core.commit_root(manifest, *generation);
-                if is_injected_crash(&core_result) {
-                    fault_triggered = true;
-                    recovery_required = true;
-                    StepOutcome::InjectedCrash
-                } else {
-                    let model_result = model.commit_root(manifest, *generation);
-                    match (core_result, model_result) {
-                        (Ok(core_root), Ok(model_root)) => {
-                            compare_roots(index, &core_root, &model_root)?;
-                            compare_oracle_root(index, &core_root, oracle.steps[index].root)?;
-                            StepOutcome::Accepted
-                        }
-                        (Err(core_error), Err(model_error)) => compare_rejections(
-                            index,
-                            &core_error,
-                            &model_error,
-                            RejectionContext::CommitRoot,
-                        )?,
-                        (Ok(_), Err(error)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("model rejected root: {error:?}"),
-                            ))
-                        }
-                        (Err(error), Ok(_)) => {
-                            return Err(divergence(
-                                index,
-                                &format!("core rejected root: {error:?}"),
-                            ))
-                        }
-                    }
-                }
-            }
-            StoreOp::CrashReopen => {
-                let device = core.into_device();
-                let mut device = device;
-                device.crash();
-                let probe_device = device.clone();
-                core = Store::open(device).map_err(|error| ReplayError::Core {
-                    kind: CoreFailureKind::Reopen,
-                    device: device_failure_kind(&error),
-                    detail: format!("reopen failed: {error:?}"),
-                })?;
-                compare_visible_state(index, &mut core, &oracle.snapshot, &probe_device)?;
-                recovery_required = false;
-                StepOutcome::Reopened
-            }
-        };
-        if outcome != oracle.steps[index].outcome {
-            return Err(divergence(
-                index,
-                &format!(
-                    "oracle expected {:?}, execution returned {:?}",
-                    oracle.steps[index].outcome, outcome
-                ),
-            ));
+
+        let device = core.into_device();
+        let recovered = Store::open(device).map_err(|error| ReplayError::Core {
+            kind: CoreFailureKind::FinalReportReopen,
+            device: device_failure_kind(&error),
+            detail: format!("final report reopen failed: {error:?}"),
+        })?;
+        let recovered_root = recovered.current_root().map(root_report);
+        let device = recovered.into_device();
+        ensure_script_rules_triggered(&case.disk.script.rules, &device.trace())?;
+        Ok(ReplayReport {
+            version: REPLAY_VERSION,
+            steps: reports,
+            recovered_root,
+            durable_digest: *blake3::hash(device.durable_bytes()).as_bytes(),
+            pending_writes: device.pending_writes(),
+            device_events: device.trace().len(),
+            virtual_time: device.virtual_time(),
+        })
+    })();
+    let coverage = ensure_script_rule_hits(&case.disk.script.rules, &rule_hits);
+    match result {
+        Err(error) => Err(error),
+        Ok(report) => coverage.map(|()| report),
+    }
+}
+
+fn ensure_script_rule_hits(
+    rules: &[DeviceRule],
+    hits: &std::sync::Mutex<Vec<bool>>,
+) -> Result<(), ReplayError> {
+    let hits = hits.lock().expect("device rule-hit mutex poisoned");
+    for (index, _) in rules.iter().enumerate() {
+        if !hits.get(index).copied().unwrap_or(false) {
+            return Err(ReplayError::InvalidCase(format!(
+                "device rule {index} was not triggered"
+            )));
         }
-        reports.push(StepReport {
-            step: index as u16,
-            outcome,
+    }
+    Ok(())
+}
+
+fn ensure_script_rules_triggered(
+    rules: &[DeviceRule],
+    trace: &[DeviceEvent],
+) -> Result<(), ReplayError> {
+    for (index, rule) in rules.iter().enumerate() {
+        let matched = trace.iter().any(|event| {
+            event.script_rule == Some(index as u32) && event.script_effect == Some(rule.effect)
         });
+        if !matched {
+            return Err(ReplayError::InvalidCase(format!(
+                "device rule {index} was not triggered"
+            )));
+        }
     }
-
-    if case.crash.is_some() && !fault_triggered {
-        return Err(ReplayError::UntriggeredCrash);
-    }
-    let device = core.into_device();
-    let recovered = Store::open(device).map_err(|error| ReplayError::Core {
-        kind: CoreFailureKind::FinalReportReopen,
-        device: device_failure_kind(&error),
-        detail: format!("final report reopen failed: {error:?}"),
-    })?;
-    let recovered_root = recovered.current_root().map(root_report);
-    let device = recovered.into_device();
-    Ok(ReplayReport {
-        version: REPLAY_VERSION,
-        steps: reports,
-        recovered_root,
-        resolved_fault_op,
-        durable_digest: *blake3::hash(device.durable_bytes()).as_bytes(),
-        pending_writes: device.pending_writes(),
-        op_index: device.op_index(),
-        faults_remaining: device.faults_remaining(),
-        virtual_time: device.virtual_time(),
-    })
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -713,107 +677,6 @@ fn required_capacity_for_record(current: u64, payload_len: usize) -> Result<u64,
         .ok_or_else(|| ReplayError::InvalidCase("record alignment overflow".into()))
 }
 
-fn resolve_fault(case: &ReplayCase) -> Result<Option<Fault>, ReplayError> {
-    let Some(point) = &case.crash else {
-        return Ok(None);
-    };
-    let mut model = Model::default();
-    let mut chunk_slots = HashMap::<u8, [u8; 32]>::new();
-    let mut manifest_slots = HashMap::<u8, [u8; 32]>::new();
-    let mut operation_cursor = FORMAT_MUTATIONS;
-    for (index, operation) in case.operations.iter().enumerate() {
-        let mutations = plan_operation(
-            index,
-            operation,
-            &mut model,
-            &mut chunk_slots,
-            &mut manifest_slots,
-        )?;
-        if index == usize::from(point.step) {
-            let offset = phase_offset(operation, point.phase).ok_or_else(|| {
-                ReplayError::InvalidCase(format!(
-                    "phase {:?} does not apply to step {index}",
-                    point.phase
-                ))
-            })?;
-            if mutations == 0 || offset >= mutations {
-                return Err(ReplayError::InvalidCase(
-                    "crash point targets a step without the requested mutation phase".into(),
-                ));
-            }
-            let operation_id = operation_cursor + offset;
-            return Ok(Some(match point.timing {
-                CrashTiming::Before => Fault::CrashBeforeOp(operation_id),
-                CrashTiming::After => Fault::CrashAfterOp(operation_id),
-            }));
-        }
-        operation_cursor += mutations;
-    }
-    Err(ReplayError::InvalidCase(
-        "crash point step is out of range".into(),
-    ))
-}
-
-fn plan_operation(
-    step: usize,
-    operation: &StoreOp,
-    model: &mut Model,
-    chunk_slots: &mut HashMap<u8, [u8; 32]>,
-    manifest_slots: &mut HashMap<u8, [u8; 32]>,
-) -> Result<u64, ReplayError> {
-    match operation {
-        StoreOp::PutChunk { slot, bytes } => {
-            let id = cairn_model::chunk_id(bytes);
-            let is_new = model.get(&id).is_none() && model.pending(&id).is_none();
-            model.put_bytes(bytes.clone()).map_err(|error| {
-                divergence(step, &format!("model planning chunk failed: {error:?}"))
-            })?;
-            chunk_slots.insert(*slot, id);
-            Ok(if is_new { 3 } else { 0 })
-        }
-        StoreOp::PutManifest { slot, chunks } => {
-            let model_chunks = resolve_model_chunks(step, chunks, chunk_slots)?;
-            let id = model.put_manifest(&model_chunks).map_err(|error| {
-                divergence(step, &format!("model planning manifest failed: {error:?}"))
-            })?;
-            manifest_slots.insert(*slot, id);
-            Ok(3)
-        }
-        StoreOp::CommitRoot {
-            manifest_slot,
-            generation,
-        } => {
-            let manifest = *manifest_slots.get(manifest_slot).ok_or_else(|| {
-                ReplayError::InvalidCase(format!(
-                    "step {step} references unknown manifest slot {manifest_slot}"
-                ))
-            })?;
-            let result = model.commit_root(manifest, *generation);
-            Ok(if result.is_ok() { 5 } else { 0 })
-        }
-        StoreOp::CrashReopen => Ok(0),
-    }
-}
-
-fn phase_offset(operation: &StoreOp, phase: MutationPhase) -> Option<u64> {
-    match operation {
-        StoreOp::PutChunk { .. } | StoreOp::PutManifest { .. } => match phase {
-            MutationPhase::RecordHeaderWrite => Some(0),
-            MutationPhase::RecordPayloadWrite => Some(1),
-            MutationPhase::RecordFlush => Some(2),
-            MutationPhase::SuperblockWrite | MutationPhase::SuperblockFlush => None,
-        },
-        StoreOp::CommitRoot { .. } => match phase {
-            MutationPhase::RecordHeaderWrite => Some(0),
-            MutationPhase::RecordPayloadWrite => Some(1),
-            MutationPhase::RecordFlush => Some(2),
-            MutationPhase::SuperblockWrite => Some(3),
-            MutationPhase::SuperblockFlush => Some(4),
-        },
-        StoreOp::CrashReopen => None,
-    }
-}
-
 fn resolve_core_chunks(
     step: usize,
     chunks: &[ChunkSpec],
@@ -907,21 +770,89 @@ fn compare_visible_state(
             return Err(divergence(step, "recovered chunk visibility differs"));
         }
     }
-    let Some(current_generation) = core.current_root().map(|root| root.generation) else {
-        return Ok(());
-    };
-    if current_generation == u64::MAX {
-        return Ok(());
-    }
-    let generation = current_generation + 1;
     for id in oracle.known_manifests.keys() {
-        let actual = probe_manifest(probe_device, *id, generation)?;
+        let actual = probe_manifest(probe_device, *id)?;
         let expected = oracle_manifest_visibility(oracle, id);
         if actual != expected {
             return Err(divergence(step, "recovered manifest visibility differs"));
         }
     }
     Ok(())
+}
+
+fn recovery_snapshot_after_device_crash(
+    case: &ReplayCase,
+    oracle: &OraclePlan,
+    reopen_step: usize,
+    device: &SimDisk,
+) -> Result<OracleSnapshot, ReplayError> {
+    let crash_step = reopen_step.checked_sub(1).ok_or_else(|| {
+        ReplayError::InvalidCase("injected crash must precede crash_reopen".into())
+    })?;
+    let event = device
+        .trace()
+        .into_iter()
+        .rev()
+        .find(|event| event.outcome == cairn_device::DeviceEventOutcome::Crashed)
+        .ok_or_else(|| ReplayError::Core {
+            kind: CoreFailureKind::Reopen,
+            device: None,
+            detail: "injected crash has no crashed device event".into(),
+        })?;
+    let publishes_after_event = match event.script_effect {
+        Some(cairn_device::DeviceEffect::CrashAfter) => {
+            event.kind == cairn_device::DeviceEventKind::FlushAll
+        }
+        Some(cairn_device::DeviceEffect::TearAndCrashAfter { durable_prefix }) => {
+            event.kind == cairn_device::DeviceEventKind::Write
+                && is_superblock_write(&event)
+                && atomic_durable_prefix(
+                    case.disk.script.atomic_unit,
+                    event.offset,
+                    event.len,
+                    durable_prefix,
+                ) == event.len
+        }
+        _ => false,
+    };
+    if publishes_after_event {
+        return Ok(oracle.after_snapshots[crash_step].clone());
+    }
+    let mut snapshot = oracle.before_snapshots[crash_step].clone();
+    let after = &oracle.after_snapshots[crash_step];
+    snapshot.known_chunks.extend(
+        after
+            .known_chunks
+            .iter()
+            .map(|(id, bytes)| (*id, bytes.clone())),
+    );
+    snapshot.known_manifests.extend(
+        after
+            .known_manifests
+            .iter()
+            .map(|(id, manifest)| (*id, manifest.clone())),
+    );
+    Ok(snapshot)
+}
+
+fn is_superblock_write(event: &cairn_device::DeviceEvent) -> bool {
+    event.len == 128 && (event.offset == 0 || event.offset == cairn_core::SLOT_SIZE)
+}
+
+fn atomic_durable_prefix(atomic_unit: usize, offset: u64, len: usize, requested: usize) -> usize {
+    let atomic_unit = atomic_unit.max(1);
+    let end = requested.min(len);
+    let mut cursor = 0;
+    while cursor < end {
+        let absolute = offset as usize + cursor;
+        let remaining = atomic_unit - absolute % atomic_unit;
+        let segment = remaining.min(len - cursor);
+        if cursor + segment > end {
+            break;
+        }
+        cursor += segment;
+    }
+    cursor
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -947,18 +878,14 @@ fn oracle_manifest_visibility(oracle: &OracleSnapshot, id: &[u8; 32]) -> Manifes
     }
 }
 
-fn probe_manifest(
-    device: &SimDisk,
-    manifest: [u8; 32],
-    generation: u64,
-) -> Result<ManifestVisibility, ReplayError> {
+fn probe_manifest(device: &SimDisk, manifest: [u8; 32]) -> Result<ManifestVisibility, ReplayError> {
     let mut probe = Store::open(device.clone()).map_err(|error| ReplayError::Core {
         kind: CoreFailureKind::ManifestProbeOpen,
         device: device_failure_kind(&error),
         detail: format!("manifest probe open failed: {error:?}"),
     })?;
-    match probe.commit_root(manifest, generation) {
-        Ok(_) => Ok(ManifestVisibility::Valid),
+    match probe.validate_manifest(&manifest) {
+        Ok(()) => Ok(ManifestVisibility::Valid),
         Err(CoreError::NotFound(id)) if id == manifest => Ok(ManifestVisibility::Hidden),
         Err(CoreError::NotFound(_)) | Err(CoreError::Corruption(_)) => {
             Ok(ManifestVisibility::Invalid)
@@ -1049,26 +976,13 @@ fn divergence(step: usize, detail: &str) -> ReplayError {
     }
 }
 
-fn fault_operation(fault: &Fault) -> u64 {
-    match fault {
-        Fault::CrashBeforeOp(operation)
-        | Fault::CrashAfterOp(operation)
-        | Fault::FailOp(operation)
-        | Fault::TimeoutOp(operation)
-        | Fault::DropWrite(operation)
-        | Fault::ShortWrite { op: operation, .. }
-        | Fault::TearWrite { op: operation, .. } => *operation,
-        Fault::ReadFail { .. } => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn manifest_probe_distinguishes_hidden_and_missing_chunk() {
-        let disk = SimDisk::new(64 * 1024, SimConfig::default());
+        let disk = SimDisk::new(64 * 1024);
         let mut store = Store::format(disk).unwrap();
         let missing_chunk = [0x5a; 32];
         let invalid_manifest = store
@@ -1083,14 +997,14 @@ mod tests {
             .unwrap();
         store.commit_root(valid_manifest, 1).unwrap();
         let mut device = store.into_device();
-        device.crash();
+        device.power_loss();
 
         assert_eq!(
-            probe_manifest(&device, invalid_manifest, 2).unwrap(),
+            probe_manifest(&device, invalid_manifest).unwrap(),
             ManifestVisibility::Invalid
         );
         assert_eq!(
-            probe_manifest(&device, [0; 32], 2).unwrap(),
+            probe_manifest(&device, [0; 32]).unwrap(),
             ManifestVisibility::Hidden
         );
     }

@@ -295,11 +295,11 @@ impl<D: BlockDevice> Store<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_device::{SimConfig, SimDisk};
+    use cairn_device::SimDisk;
 
     #[test]
     fn put_get_commit_and_reopen() {
-        let disk = SimDisk::new(128 * 1024, SimConfig::default());
+        let disk = SimDisk::new(128 * 1024);
         let mut store = Store::format(disk).unwrap();
         let id = store.put_bytes(b"hello").unwrap();
         assert_eq!(store.get_bytes(&id).unwrap(), b"hello");
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn corrupted_record_is_rejected() {
-        let disk = SimDisk::new(128 * 1024, SimConfig::default());
+        let disk = SimDisk::new(128 * 1024);
         let mut store = Store::format(disk).unwrap();
         let id = store.put_bytes(b"hello").unwrap();
         store.device.durable_bytes();

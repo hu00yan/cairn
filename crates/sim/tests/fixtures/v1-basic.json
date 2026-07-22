@@ -2,7 +2,7 @@
   "version": 1,
   "disk": {
     "capacity_bytes": 262144,
-    "latency": {}
+    "script": {}
   },
   "operations": [
     {

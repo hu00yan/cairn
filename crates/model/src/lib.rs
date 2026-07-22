@@ -329,7 +329,7 @@ mod tests {
             },
         ];
 
-        let disk = cairn_device::SimDisk::new(16 * 1024, Default::default());
+        let disk = cairn_device::SimDisk::new(16 * 1024);
         let mut core = cairn_core::Store::format(disk).unwrap();
         assert_eq!(core.put_bytes(first_bytes).unwrap(), first);
         assert_eq!(core.put_bytes(second_bytes).unwrap(), second);

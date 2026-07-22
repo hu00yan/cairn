@@ -2,7 +2,16 @@
   "version": 1,
   "disk": {
     "capacity_bytes": 262144,
-    "latency": {}
+    "script": {
+      "rules": [{
+        "selector": {
+          "kind": "flush_all",
+          "occurrence": {"exact": 19},
+          "range": null
+        },
+        "effect": "crash_after"
+      }]
+    }
   },
   "operations": [
     {
@@ -28,10 +37,5 @@
     {
       "op": "crash_reopen"
     }
-  ],
-  "crash": {
-    "step": 2,
-    "phase": "superblock_flush",
-    "timing": "after"
-  }
+  ]
 }

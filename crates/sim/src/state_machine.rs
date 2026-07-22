@@ -1,6 +1,10 @@
 use crate::replay::{
-    encode_json, ChunkSpec, CoreFailureKind, CrashPoint, CrashTiming, DeviceFailureKind, DiskSpec,
-    DivergenceKind, LatencySpec, MutationPhase, ReplayCase, ReplayError, StoreOp,
+    encode_json, ChunkSpec, CoreFailureKind, DeviceFailureKind, DiskSpec, DivergenceKind,
+    ReplayCase, ReplayError, StoreOp,
+};
+use cairn_device::{
+    ByteRange, DeviceEffect, DeviceEventKind, DeviceRule, DeviceScript, EventOccurrence,
+    EventSelector, LatencyProfile, ReorderPolicy,
 };
 
 const MAX_GENERATED_CHUNK: usize = 48;
@@ -48,7 +52,6 @@ pub enum FailureClass {
         kind: CoreFailureKind,
         device: Option<DeviceFailureKind>,
     },
-    UntriggeredCrash,
 }
 
 pub fn failure_class(error: &ReplayError) -> FailureClass {
@@ -64,7 +67,6 @@ pub fn failure_class(error: &ReplayError) -> FailureClass {
             kind: *kind,
             device: *device,
         },
-        ReplayError::UntriggeredCrash => FailureClass::UntriggeredCrash,
     }
 }
 
@@ -142,9 +144,8 @@ pub fn generate(seed: u64) -> ReplayCase {
         });
     }
 
-    // End every generated trace with a valid commit. This gives the crash
-    // planner a mutation-rich operation to cut without relying on the random
-    // prefix being accepted.
+    // End every generated trace with a valid commit. The final crash_reopen is
+    // a lifecycle boundary; device crashes come from the device script.
     let final_bytes = seed.to_le_bytes().into_iter().cycle().take(96).collect();
     let final_action = rng.below(3);
     operations.push(StoreOp::PutChunk {
@@ -166,68 +167,152 @@ pub fn generate(seed: u64) -> ReplayCase {
             generation: 1_000_000 + seed % 1_000,
         });
     }
-    let final_step = operations.len() as u16 - 1;
     operations.push(StoreOp::CrashReopen);
-
-    let crash = if seed % 3 != 0 {
-        Some(CrashPoint {
-            step: final_step,
-            phase: match if final_action == 2 {
-                rng.below(5)
-            } else {
-                rng.below(3)
-            } {
-                0 => MutationPhase::RecordHeaderWrite,
-                1 => MutationPhase::RecordPayloadWrite,
-                2 => MutationPhase::RecordFlush,
-                3 => MutationPhase::SuperblockWrite,
-                _ => MutationPhase::SuperblockFlush,
-            },
-            timing: if rng.below(2) == 0 {
-                CrashTiming::Before
-            } else {
-                CrashTiming::After
-            },
-        })
-    } else {
-        None
-    };
 
     ReplayCase {
         version: crate::replay::REPLAY_VERSION,
         seed: Some(seed),
         disk: DiskSpec {
             capacity_bytes: 128 * 1024,
-            latency: LatencySpec {
-                read_ticks: rng.below(4) as u64,
-                write_ticks: rng.below(4) as u64,
-                flush_data_ticks: rng.below(4) as u64,
-                flush_all_ticks: rng.below(4) as u64,
-                jitter_ticks: rng.below(4) as u64,
-                seed,
+            script: DeviceScript {
+                latency: LatencyProfile {
+                    read_ticks: rng.below(4) as u64,
+                    write_ticks: rng.below(4) as u64,
+                    flush_data_ticks: rng.below(4) as u64,
+                    flush_all_ticks: rng.below(4) as u64,
+                    jitter_ticks: rng.below(4) as u64,
+                    seed,
+                },
+                ..Default::default()
             },
         },
         operations,
-        crash,
+    }
+}
+
+/// Generate a device-only script for the independent byte-level simulator
+/// corpus. These scripts are intentionally not fed into the Store oracle:
+/// their purpose is to exercise the block-device contract itself.
+pub fn generate_device_script(seed: u64) -> DeviceScript {
+    let (kind, occurrence, effect) = match seed % 16 {
+        0 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::Fail,
+        ),
+        1 => (
+            DeviceEventKind::Read,
+            EventOccurrence::Exact(4),
+            DeviceEffect::Timeout,
+        ),
+        2 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::Drop,
+        ),
+        3 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::Short { bytes: 2 },
+        ),
+        4 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::Tear { durable_prefix: 3 },
+        ),
+        5 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::CrashBefore,
+        ),
+        6 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::CrashAfter,
+        ),
+        7 => (
+            DeviceEventKind::Write,
+            EventOccurrence::Exact(0),
+            DeviceEffect::TearAndCrashAfter { durable_prefix: 3 },
+        ),
+        8 => (
+            DeviceEventKind::FlushData,
+            EventOccurrence::Exact(2),
+            DeviceEffect::Fail,
+        ),
+        9 => (
+            DeviceEventKind::FlushData,
+            EventOccurrence::Exact(2),
+            DeviceEffect::Timeout,
+        ),
+        10 => (
+            DeviceEventKind::FlushData,
+            EventOccurrence::Exact(2),
+            DeviceEffect::Drop,
+        ),
+        11 => (
+            DeviceEventKind::FlushData,
+            EventOccurrence::Exact(2),
+            DeviceEffect::CrashBefore,
+        ),
+        12 => (
+            DeviceEventKind::FlushData,
+            EventOccurrence::Exact(2),
+            DeviceEffect::CrashAfter,
+        ),
+        13 => (
+            DeviceEventKind::FlushAll,
+            EventOccurrence::Exact(3),
+            DeviceEffect::Fail,
+        ),
+        14 => (
+            DeviceEventKind::FlushAll,
+            EventOccurrence::Exact(3),
+            DeviceEffect::Drop,
+        ),
+        _ => (
+            DeviceEventKind::FlushAll,
+            EventOccurrence::Exact(3),
+            DeviceEffect::CrashAfter,
+        ),
+    };
+    DeviceScript {
+        atomic_unit: 1 + (seed as usize % 4),
+        reorder: Some(ReorderPolicy::Seeded {
+            window: 1 + (seed as u32 % 4),
+            seed,
+        }),
+        flush_data_writes: (seed % 3 == 0).then_some(1),
+        latency: LatencyProfile {
+            read_ticks: seed % 3,
+            write_ticks: (seed / 3) % 3,
+            flush_data_ticks: (seed / 7) % 3,
+            flush_all_ticks: (seed / 11) % 3,
+            jitter_ticks: seed % 5,
+            seed,
+        },
+        bad_ranges: (seed % 13 == 0)
+            .then_some(ByteRange { offset: 48, len: 4 })
+            .into_iter()
+            .collect(),
+        rules: vec![DeviceRule {
+            selector: EventSelector {
+                kind,
+                occurrence,
+                range: None,
+            },
+            effect,
+        }],
+        latency_rules: Vec::new(),
     }
 }
 
 fn candidate_without(case: &ReplayCase, remove: usize) -> Option<ReplayCase> {
-    if remove >= case.operations.len().saturating_sub(1)
-        || case
-            .crash
-            .as_ref()
-            .is_some_and(|point| usize::from(point.step) == remove)
-    {
+    if remove >= case.operations.len().saturating_sub(1) {
         return None;
     }
     let mut candidate = case.clone();
     candidate.operations.remove(remove);
-    if let Some(point) = &mut candidate.crash {
-        if usize::from(point.step) > remove {
-            point.step -= 1;
-        }
-    }
     Some(candidate)
 }
 
@@ -369,28 +454,24 @@ mod tests {
         let expected = [
             (
                 0,
-                "c12e5a292f2a30cd42dc2ce3b6b524f10ef2327d37f4b4eb6bc3d21ca5d7dd49",
+                "daa0c5695ed1e04c2983448647a88a73ae5a3fd4732d6eaccd979eaeb117800c",
             ),
             (
                 1,
-                "6819546d42f42ceeab5959b8898d1c7d8a1992cc858fea7ce2e69b3675c0849c",
+                "7ad4af359bb44f38cd46094552c12680e750d23d9cf32a7f5331ae782795a9d0",
             ),
             (
                 41,
-                "f6eb93ebaaf6950b532e50032542d7512b008227502dc0af5f95d145e44846c9",
+                "d303240fbe3c0e661d2293390a890dc435d343113531990fbe911964808d24f0",
             ),
             (
                 u64::MAX,
-                "236d3ba408a0166911b1794fc8a50f8d1760eca18a64f74178d31af18f8cc725",
+                "e488289138f4da5737ee94dc86b4ca363d023dd062ba861acfaa855364172457",
             ),
         ];
         for (seed, expected) in expected {
-            assert_eq!(
-                blake3::hash(&encode_json(&generate(seed)).unwrap())
-                    .to_hex()
-                    .as_str(),
-                expected
-            );
+            let encoded = encode_json(&generate(seed)).unwrap();
+            assert_eq!(blake3::hash(&encoded).to_hex().as_str(), expected);
         }
     }
 }

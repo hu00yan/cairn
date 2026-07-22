@@ -360,7 +360,7 @@ impl<D: BlockDevice> Store<D> {
                     generation: s.generation,
                     manifest: s.manifest,
                 });
-                if let Err(e) = st.validate_manifest(s.manifest) {
+                if let Err(e) = st.validate_manifest(&s.manifest) {
                     if !matches!(e, Error::Corruption(_) | Error::NotFound(_)) {
                         return Err(e);
                     }
@@ -480,7 +480,7 @@ impl<D: BlockDevice> Store<D> {
         {
             return Err(Error::InvalidInput("root generation must increase"));
         };
-        self.validate_manifest(manifest)?;
+        self.validate_manifest(&manifest)?;
         let mut p = Vec::with_capacity(40);
         p.extend_from_slice(&manifest);
         p.extend_from_slice(&generation.to_le_bytes());
@@ -517,7 +517,8 @@ impl<D: BlockDevice> Store<D> {
         self.root = Some(r.clone());
         Ok(r)
     }
-    fn validate_manifest(&mut self, id: ObjectId) -> Result<(), Error> {
+    pub fn validate_manifest(&mut self, id: &ObjectId) -> Result<(), Error> {
+        let id = *id;
         let e = *self.index.get(&id).ok_or(Error::NotFound(id))?;
         if e.kind != Kind::Manifest {
             return Err(Error::Corruption("root not manifest"));
@@ -680,15 +681,12 @@ impl<D: BlockDevice> Store<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_device::{Fault, SimConfig, SimDisk};
+    use cairn_device::{
+        DeviceEffect, DeviceEventKind, DeviceRule, DeviceScript, EventOccurrence, EventSelector,
+        SimDisk,
+    };
     fn disk() -> SimDisk {
-        SimDisk::new(
-            256 * 1024,
-            SimConfig {
-                atomic_write_size: 1,
-                ..Default::default()
-            },
-        )
+        SimDisk::new(256 * 1024)
     }
     #[test]
     fn commit_reopen() {
@@ -729,7 +727,7 @@ mod tests {
         let mut s = Store::format(disk()).unwrap();
         let c = s.put_bytes(b"uncommitted").unwrap();
         let mut disk = s.into_device();
-        disk.crash();
+        disk.power_loss();
         let mut reopened = Store::open(disk).unwrap();
         assert!(matches!(reopened.get_bytes(&c), Err(Error::NotFound(_))));
     }
@@ -762,14 +760,21 @@ mod tests {
     #[test]
     fn contract_append_failure_requires_recovery() {
         let mut store = Store::format(
-            SimDisk::new(
+            SimDisk::from_script(
                 256 * 1024,
-                SimConfig {
-                    atomic_write_size: 1,
+                DeviceScript {
+                    rules: vec![DeviceRule {
+                        selector: EventSelector {
+                            kind: DeviceEventKind::Write,
+                            occurrence: EventOccurrence::Exact(3),
+                            range: None,
+                        },
+                        effect: DeviceEffect::Fail,
+                    }],
                     ..Default::default()
                 },
             )
-            .with_fault(Fault::FailOp(3)),
+            .unwrap(),
         )
         .unwrap();
         assert!(matches!(

@@ -30,9 +30,10 @@ experiments fast and deterministic.
 The first implementation now provides these deterministic primitives:
 
 - `SimDisk`: volatile versus durable bytes, pending writes, explicit flush,
-  crash recovery, atomic-write-unit torn-write behavior, configurable flush
-  subset/order, durable corruption, read failure, dropped write, short write,
-  operation failure/crash, one-shot fault schedules, and virtual I/O latency;
+  power-loss recovery, atomic-unit torn writes, bounded partial flushes,
+  deterministic device-local reorder, durable corruption, bad media ranges,
+  read/write/flush failure, dropped and short I/O, crash-before/after and
+  tear-and-crash effects, and virtual I/O latency;
 - `SimNetwork`: numeric per-link latency, drop, duplicate, deterministic
   reordering frozen at send time, directional connection interruption,
   node pause/resume, node crash/restart with epoch, and bidirectional
@@ -47,27 +48,27 @@ The first implementation now provides these deterministic primitives:
   current bounded tests without wall-clock sleeps or real devices;
 - the trace is an input record, not yet a standalone generic replay runner.
 
-`SimDisk` fault operation numbers intentionally cover state-changing writes and
-flushes only; reads use persistent range faults because `BlockDevice::read_at`
-is observational and takes `&self`. A future concurrent-reader seam may add a
-separate read event stream without changing durability operation numbering.
-
-The next simulator-only additions are broader property/state-machine
-generators and a standalone replay runner. They must stay on these in-memory
-seams before the storage core starts depending on them.
+`DeviceScript` is the only simulator configuration surface. Selectors match
+device event kind, physical byte range, and global device-event occurrence
+(`any`, `exact`, or `every`); they never name a Cairn operation. The script is
+serializable and replayable. `FileDevice` remains the production adapter and
+is not expected to reproduce simulated power-loss or torn-media behavior.
 
 ## SR-01: bounded store replay
 
-The first replay slice uses a versioned JSON case and runs the same bounded
-store operations against `cairn-core + SimDisk` and `cairn-model`. It supports
-`put_chunk`, `put_manifest`, `commit_root`, and a final `crash_reopen`. A case
-may inject one deterministic crash immediately before the final reopen. The
-crash phases cover record header, record payload, record flush, superblock
-write, and superblock flush, each before or after the selected operation.
+The replay slice uses a versioned JSON case and runs the same bounded store
+operations against `cairn-core + SimDisk` and `cairn-model`. It supports
+`put_chunk`, `put_manifest`, `commit_root`, a final `crash_reopen`, and a
+serializable `DeviceScript`. Device crashes are selected by device event and
+physical range, not by a store mutation phase. Fault-free cases are checked
+against the independent logical oracle; faulted crashes are checked at the
+device trace and reopen boundary.
 
 The runner is intentionally single-node: it does not use `FileDevice`,
-`SimNetwork`, sockets, wall-clock sleeps, torn writes, or multi-fault schedules.
-Cases are bounded to 64 operations, 32 slots, 4 KiB per chunk, 64 KiB total
+`SimNetwork`, sockets, or wall-clock sleeps. Its `DeviceScript` may inject
+tears and multiple non-overlapping device rules, but the storage oracle does
+not assign upper-layer meaning to arbitrary fault combinations. Cases are
+bounded to 64 operations, 32 slots, 4 KiB per chunk, 64 KiB total
 payload, and a 16 KiB–1 MiB simulated disk. The JSON runner also rejects
 inputs larger than 1 MiB before deserialization, so the CLI's input bound is
 enforced before constructing an untrusted case.
@@ -83,67 +84,71 @@ cargo run -p cairn-sim --bin cairn-replay -- crates/sim/tests/fixtures/v1-crash-
 ## SR-02: replay trust boundary
 
 SR-02 adds a private pure-computation oracle to the replay runner. It does not
-use `cairn-model`, the physical fault planner, or device operation IDs. The
+use `cairn-model` or device operation IDs. The
 oracle independently computes object IDs, manifest validity, pending versus
 visible objects, and recovery roots.
 
-The fixed two-generation matrix starts with generation 10, stages generation
-20, and checks all 22 crash cuts. It requires the old root to survive every
-cut except `CrashAfter(SuperblockFlush)`, where the call still returns an
-injected crash but recovery must expose generation 20. Recovery probes chunks
-and manifests separately, including records that are physically visible but
-logically invalid. If the recovered generation is `u64::MAX`, root and chunk
-visibility checks still run; manifest terminal probes are skipped because the
-core API requires a strictly larger probe generation.
+The device-level tests cover volatile/durable visibility, partial flushes,
+atomic-unit tears, reorder, bad ranges, every device effect, power loss, trace
+order, and deterministic virtual time. The storage replay runner does not
+pretend that a logical model can predict every arbitrary device script; it
+gates fault-free logical equivalence and separately gates device semantics.
 
-This remains a bounded single-node trust layer. It does not claim coverage for
-torn/reordered writes, multiple faults, format crash, compaction, EC,
-replication, networking, or filesystem durability.
+This remains a bounded single-node logical trust layer. Device-effect coverage
+lives in the independent HAL corpus; the logical oracle does not claim to
+predict multiple arbitrary device faults, compaction, EC, replication,
+networking, or filesystem durability.
 
 ## SR-03: deterministic state-machine corpus
 
 SR-03 adds an in-tree SplitMix64 generator and deterministic shrinker. It
 generates bounded multi-generation traces with duplicate writes, empty and
 mis-sized manifest references, rejected generations, latency variation, and a
-randomly selected final chunk, manifest, or valid root operation. Most seeds
-also cut that operation at a valid write or flush phase before `crash_reopen`.
+randomly selected final chunk, manifest, or valid root operation. A separate
+10,000-seed device-script corpus exercises fault effects independently of the
+store oracle.
 
-The default corpus runs 10,000 seeds in `crates/sim/tests/state_machine.rs`.
-Each seed is stored in the `ReplayCase.seed` field, and a failure is reduced in
-a fixed order (remove operations, then payloads and generations) before the
-test prints JSON accepted by `cairn-replay`. The generator adds no third-party
-dependency and does not replace the independent replay oracle.
+The logical replay corpus runs 1,000 seeds, while the independent device
+script corpus runs 10,000 seeds, in `crates/sim/tests/state_machine.rs`.
+Each logical seed is stored in the `ReplayCase.seed` field, and a logical
+failure is reduced in a fixed order (remove operations, then payloads and
+generations) before the test prints JSON accepted by `cairn-replay`. The
+generator adds no third-party dependency and does not replace the independent
+replay oracle.
 
-The corpus has hard coverage assertions for duplicate payloads, mis-sized
-references, accepted/rejected generations, both crash timings, all applicable
-crash phases, all three final operation kinds, and no-crash cases. It also
-stores cross-platform golden hashes for representative seeds and keeps a
-failure's structured class during shrinking. A core failure class includes its
-recovery stage and, when applicable, the underlying device failure kind, so a
-short I/O cannot be shrunk into a media error merely because both happened
-during reopen.
+The corpus has observed deterministic coverage for duplicate payloads,
+mis-sized references, accepted/rejected generations, device effect classes,
+all device event kinds, bad-range failures, and no-wall-clock virtual time.
+The device corpus independently computes the expected durable and pending
+state for its fixed schedules; unit tests cover the remaining operation-level
+outcomes. It stores cross-platform golden hashes for representative logical
+seeds and keeps a failure's structured class during shrinking. A core failure
+class includes its recovery stage and, when applicable, the underlying device
+failure kind.
 
 This is a coverage amplifier, not a claim that the single-node simulator is
-complete. The device-only HAL now has event-based rules for torn writes,
-non-crash I/O failures, read failures, bad media, and deterministic latency.
-The storage replay runner still uses its version-1 compatibility fault cursor;
-the new device rules are not yet serialized into that upper-layer corpus.
+complete. The device-only HAL and its independent corpus are the correctness
+seam; the storage replay oracle deliberately remains a logical oracle for
+fault-free equivalence and does not invent upper-layer meanings for device
+effects.
 
 ## Fault dimensions
 
 The minimum simulation surface is:
 
-- device: volatile/durable/pending state, flush, crash, torn writes, reorder,
-  corruption, capacity exhaustion, read/write/flush failure;
+- device: volatile/durable/pending state, flush, power loss, torn writes,
+  partial persistence, reorder, corruption, capacity exhaustion,
+  read/write/flush failure;
 - network: per-link latency, drop, duplicate, reorder, disconnect, pause, and
   bidirectional partition;
 - process: node pause, crash, restart, and deterministic recovery;
-- observability: seed/trace, virtual time, operation sequence, durable digest,
-  pending counts, and fault cursor.
+- observability: seed/trace, virtual time, device event sequence, durable
+  digest, and pending counts.
 
 The simulator must not attempt to reproduce SSD firmware, physical seek,
-NVMe/SATA timing, or every operating-system cache behavior. Those are separate
-performance experiments, not correctness prerequisites.
+NVMe/SATA timing, or every operating-system cache behavior. Those become
+composable latency/state policies over the same device events, not new core
+APIs.
 
 ## SR-04: block-device HAL direction
 
@@ -156,15 +161,13 @@ device with four deliberately small dimensions:
    device error.
 2. **Persistence** — a successful write updates the volatile device view and a
    pending write set. A dropped write is acknowledged but updates neither.
-   `flush_data`/`flush_all` advance selected writes to the durable medium.
-   `crash` discards pending state and rebuilds the volatile view from durable
-   bytes.
+   `flush_data`/`flush_all` advance device-local pending writes to the durable
+   medium, optionally with a bounded flush budget. `power_loss` discards
+   pending state and rebuilds the volatile view from durable bytes.
 3. **Device events** — each device call internally records a monotonic event
    with kind, range, effect, and sequence number. Fault rules match device
-   event kind, physical range, and a device event sequence. They never match a
-   Cairn core operation ID. Legacy operation faults and device event faults are
-   mutually exclusive, so an injected error has an explicit operation or event
-   source instead of an ambiguous `op` field.
+   event kind, physical range, and a device event occurrence. They never match
+   a Cairn core operation ID. There is no legacy operation-fault path.
    The event clock is protected by one mutex: concurrent observational reads
    are linearized there, and virtual latency accumulates in that same order.
 4. **Virtual time** — each event gets `base_latency + seeded_jitter`. The

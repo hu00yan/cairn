@@ -1,11 +1,11 @@
 use cairn_core::{ChunkRef as CoreChunkRef, Error as CoreError, Root as CoreRoot, Store};
-use cairn_device::{SimConfig, SimDisk};
+use cairn_device::SimDisk;
 use cairn_model::{ChunkRef, Error as ModelError, Model, ObjectId, Root as ModelRoot};
 
 const DISK_SIZE: usize = 64 * 1024;
 
 fn disk() -> SimDisk {
-    SimDisk::new(DISK_SIZE, SimConfig::default())
+    SimDisk::new(DISK_SIZE)
 }
 
 fn core_chunks(chunks: &[ChunkRef]) -> Vec<CoreChunkRef> {
@@ -274,7 +274,7 @@ fn reopen_after_crash_only_exposes_the_last_committed_root() {
     let pending_id = core.put_bytes(pending).unwrap();
     assert_eq!(model.put_bytes(pending.to_vec()).unwrap(), pending_id);
     let mut disk = core.into_device();
-    disk.crash();
+    disk.power_loss();
     let mut reopened_core = Store::open(disk).unwrap();
     let reopened_model = model.reopen();
     assert_eq!(reopened_core.current_root(), Some(core_root));
