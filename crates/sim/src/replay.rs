@@ -629,6 +629,7 @@ fn core_rejection_reason(error: &CoreError, context: RejectionContext) -> Option
         }
         CoreError::Device(_)
         | CoreError::RequiresRecovery
+        | CoreError::ResourceExhausted(_)
         | CoreError::Unformatted
         | CoreError::UnsupportedFormat => None,
     }

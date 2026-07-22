@@ -46,6 +46,7 @@ pub enum Error {
     Corruption(&'static str),
     NotFound(ObjectId),
     InvalidInput(&'static str),
+    ResourceExhausted(&'static str),
     Unformatted,
     UnsupportedFormat,
     RequiresRecovery,
@@ -455,6 +456,34 @@ impl<D: BlockDevice> Store<D> {
         };
         Ok(p[32..].to_vec())
     }
+
+    pub fn get_manifest(&mut self, id: &ObjectId) -> Result<Object, Error> {
+        self.read_manifest(id)
+    }
+
+    pub fn read_root(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(root) = self.root.clone() else {
+            return Ok(None);
+        };
+        let object = self.read_manifest(&root.manifest)?;
+        let capacity = usize::try_from(object.len)
+            .map_err(|_| Error::ResourceExhausted("object length does not fit usize"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::ResourceExhausted("object allocation exceeds limit"))?;
+        for chunk in object.chunks {
+            let data = self.get_bytes(&chunk.id)?;
+            if data.len() != chunk.len as usize {
+                return Err(Error::Corruption("chunk length mismatch"));
+            }
+            bytes.extend_from_slice(&data);
+        }
+        if bytes.len() as u64 != object.len {
+            return Err(Error::Corruption("object length mismatch"));
+        }
+        Ok(Some(bytes))
+    }
     pub fn commit_root(
         &mut self,
         manifest: ObjectId,
@@ -518,15 +547,19 @@ impl<D: BlockDevice> Store<D> {
         Ok(r)
     }
     pub fn validate_manifest(&mut self, id: &ObjectId) -> Result<(), Error> {
+        self.read_manifest(id).map(|_| ())
+    }
+
+    fn read_manifest(&mut self, id: &ObjectId) -> Result<Object, Error> {
         let id = *id;
         let e = *self.index.get(&id).ok_or(Error::NotFound(id))?;
         if e.kind != Kind::Manifest {
             return Err(Error::Corruption("root not manifest"));
-        };
+        }
         let (_, p) = self.read(e.offset)?;
         if p.len() < 48 || manifest_id(&p[32..]) != id {
             return Err(Error::Corruption("manifest hash"));
-        };
+        }
         let body = &p[32..];
         let count = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
         let need = 16usize
@@ -538,9 +571,13 @@ impl<D: BlockDevice> Store<D> {
             .ok_or(Error::Corruption("manifest length"))?;
         if body.len() != need || body[0..2] != 1u16.to_le_bytes() || body[2..4] != [0; 2] {
             return Err(Error::Corruption("manifest format"));
-        };
+        }
         let total = u64::from_le_bytes(body[8..16].try_into().unwrap());
-        let mut sum: u64 = 0;
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(count)
+            .map_err(|_| Error::ResourceExhausted("manifest index allocation failed"))?;
+        let mut sum = 0u64;
         for i in 0..count {
             let a = 16 + i * 36;
             let cid: ObjectId = body[a..a + 32].try_into().unwrap();
@@ -551,7 +588,7 @@ impl<D: BlockDevice> Store<D> {
             let ce = *self.index.get(&cid).ok_or(Error::NotFound(cid))?;
             if ce.kind != Kind::Chunk {
                 return Err(Error::Corruption("manifest kind"));
-            };
+            }
             let (_, cp) = self.read(ce.offset)?;
             if cp.len() < 32
                 || cp.len() - 32 != len as usize
@@ -560,12 +597,16 @@ impl<D: BlockDevice> Store<D> {
             {
                 return Err(Error::Corruption("manifest chunk"));
             }
+            chunks.push(ChunkRef { id: cid, len });
         }
         if sum != total {
-            Err(Error::Corruption("manifest total mismatch"))
-        } else {
-            Ok(())
+            return Err(Error::Corruption("manifest total mismatch"));
         }
+        Ok(Object {
+            id,
+            len: total,
+            chunks,
+        })
     }
     fn append(&mut self, kind: Kind, p: &[u8], generation: u64) -> Result<u64, Error> {
         if p.len() > MAX as usize {
@@ -703,6 +744,62 @@ mod tests {
             })
         );
         assert_eq!(r.get_bytes(&c).unwrap(), b"hello")
+    }
+
+    #[test]
+    fn committed_root_reads_manifest_and_reassembles_object() {
+        let mut store = Store::format(disk()).unwrap();
+        let first = store.put_bytes(b"hello").unwrap();
+        let second = store.put_bytes(b" world").unwrap();
+        let manifest = store
+            .put_manifest(&[
+                ChunkRef { id: first, len: 5 },
+                ChunkRef { id: second, len: 6 },
+            ])
+            .unwrap();
+        store.commit_root(manifest, 1).unwrap();
+
+        let object = store.get_manifest(&manifest).unwrap();
+        assert_eq!(object.len, 11);
+        assert_eq!(object.chunks.len(), 2);
+        assert_eq!(store.read_root().unwrap(), Some(b"hello world".to_vec()));
+
+        let mut reopened = Store::open(store.into_device()).unwrap();
+        assert_eq!(reopened.read_root().unwrap(), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn empty_committed_root_reads_as_empty_object() {
+        let mut store = Store::format(disk()).unwrap();
+        let manifest = store.put_manifest(&[]).unwrap();
+        store.commit_root(manifest, 1).unwrap();
+        assert_eq!(store.get_manifest(&manifest).unwrap().len, 0);
+        assert_eq!(store.read_root().unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn multi_chunk_object_larger_than_record_limit_survives_reopen() {
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        const CHUNK_COUNT: usize = 65;
+        let mut store = Store::format(SimDisk::new(96 * 1024 * 1024)).unwrap();
+        let mut chunks = Vec::with_capacity(CHUNK_COUNT);
+        for index in 0..CHUNK_COUNT {
+            let data = vec![u8::try_from(index).unwrap(); CHUNK_SIZE];
+            let id = store.put_bytes(&data).unwrap();
+            chunks.push(ChunkRef {
+                id,
+                len: CHUNK_SIZE as u32,
+            });
+        }
+        let manifest = store.put_manifest(&chunks).unwrap();
+        store.commit_root(manifest, 1).unwrap();
+
+        let mut reopened = Store::open(store.into_device()).unwrap();
+        let object = reopened.read_root().unwrap().unwrap();
+        assert_eq!(object.len(), CHUNK_SIZE * CHUNK_COUNT);
+        assert_eq!(object[0], 0);
+        assert_eq!(object[CHUNK_SIZE], 1);
+        assert_eq!(object.last(), Some(&64));
     }
     #[test]
     fn chunk_is_not_manifest() {
