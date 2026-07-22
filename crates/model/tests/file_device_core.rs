@@ -45,7 +45,7 @@ impl Drop for TestFile {
 }
 
 #[test]
-#[ignore = "real filesystem smoke test; run explicitly with --ignored"]
+#[ignore = "real filesystem recovery gate; run explicitly with --ignored"]
 fn format_empty_file_closes_and_reopens() {
     let path = test_path();
     let mut cleanup = TestFile::new(path.clone());
@@ -55,11 +55,12 @@ fn format_empty_file_closes_and_reopens() {
 
     let reopened = Store::open(FileDevice::open(&path).unwrap()).unwrap();
     assert_eq!(reopened.current_root(), None);
+    drop(reopened.into_device());
     cleanup.cleanup();
 }
 
 #[test]
-#[ignore = "real filesystem smoke test; run explicitly with --ignored"]
+#[ignore = "real filesystem recovery gate; run explicitly with --ignored"]
 fn store_commit_reopen_and_latest_root_corruption_falls_back() {
     let path = test_path();
     let mut cleanup = TestFile::new(path.clone());

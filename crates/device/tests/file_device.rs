@@ -42,7 +42,7 @@ impl Drop for TestFile {
 }
 
 #[test]
-#[ignore = "real filesystem smoke test; run explicitly with --ignored"]
+#[ignore = "real filesystem contract gate; run explicitly with --ignored"]
 fn writes_flushes_and_reopens() {
     let path = test_path("reopen");
     let mut cleanup = TestFile::new(path.clone());
@@ -56,11 +56,12 @@ fn writes_flushes_and_reopens() {
     let mut bytes = [0; 5];
     device.read_at(128, &mut bytes).unwrap();
     assert_eq!(&bytes, b"cairn");
+    drop(device);
     cleanup.cleanup();
 }
 
 #[test]
-#[ignore = "real filesystem smoke test; run explicitly with --ignored"]
+#[ignore = "real filesystem contract gate; run explicitly with --ignored"]
 fn bounds_are_reported_without_touching_the_file() {
     let path = test_path("bounds");
     let mut cleanup = TestFile::new(path.clone());
@@ -79,14 +80,35 @@ fn bounds_are_reported_without_touching_the_file() {
     let mut after = [0; 8];
     device.read_at(0, &mut after).unwrap();
     assert_eq!(after, before);
+    drop(device);
 
-    let error = FileDevice::open(&path).unwrap().flush_all();
-    assert!(error.is_ok());
+    let mut reopened = FileDevice::open(&path).unwrap();
+    reopened.flush_all().unwrap();
+    let mut read = [0; 2];
+    assert!(matches!(
+        reopened.read_at(7, &mut read),
+        Err(DeviceError::OutOfBounds {
+            offset: 7,
+            len: 2,
+            capacity: 8
+        })
+    ));
+    assert!(matches!(
+        reopened.write_at(u64::MAX, b"x"),
+        Err(DeviceError::OutOfBounds {
+            offset: u64::MAX,
+            len: 1,
+            capacity: 8
+        })
+    ));
+    reopened.read_at(8, &mut []).unwrap();
+    reopened.write_at(8, &[]).unwrap();
+    drop(reopened);
     cleanup.cleanup();
 }
 
 #[test]
-#[ignore = "real filesystem smoke test; run explicitly with --ignored"]
+#[ignore = "real filesystem contract gate; run explicitly with --ignored"]
 fn open_reports_filesystem_errors_through_device_error() {
     let path = test_path("missing");
     let error = FileDevice::open(&path).unwrap_err();
@@ -97,4 +119,38 @@ fn open_reports_filesystem_errors_through_device_error() {
             ..
         }
     ));
+}
+
+#[test]
+#[ignore = "real filesystem contract gate; run explicitly with --ignored"]
+fn deterministic_io_matrix_survives_reopen() {
+    let path = test_path("matrix");
+    let mut cleanup = TestFile::new(path.clone());
+    let capacity = 257_u64;
+    let mut device = FileDevice::create_preallocated(&path, capacity).unwrap();
+
+    let cases = [(0, 0), (0, 1), (1, 7), (8, 32), (64, 129), (256, 1)];
+    for (offset, len) in cases {
+        let bytes: Vec<u8> = (0..len)
+            .map(|index| (index as u8).wrapping_mul(37))
+            .collect();
+        device.write_at(offset, &bytes).unwrap();
+        let mut read_back = vec![0; len];
+        device.read_at(offset, &mut read_back).unwrap();
+        assert_eq!(read_back, bytes, "offset={offset}, len={len}");
+    }
+    device.flush_data().unwrap();
+    drop(device);
+
+    let device = FileDevice::open(&path).unwrap();
+    for (offset, len) in cases {
+        let mut read_back = vec![0; len];
+        device.read_at(offset, &mut read_back).unwrap();
+        let expected: Vec<u8> = (0..len)
+            .map(|index| (index as u8).wrapping_mul(37))
+            .collect();
+        assert_eq!(read_back, expected, "offset={offset}, len={len}");
+    }
+    drop(device);
+    cleanup.cleanup();
 }

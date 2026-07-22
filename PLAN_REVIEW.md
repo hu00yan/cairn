@@ -2,9 +2,9 @@
 
 ## 结论摘要
 
-计划的主线是合理的：先冻结单节点不可变对象与 root 可见性，再建设故障模拟、复制、控制面、EC 和客户端集成。但当前计划过早把多个尚未冻结的语义绑定在一起，不能直接作为十个连续 coding 批次执行。
+计划的主线是合理的：先冻结单节点不可变 DAG 与 root 可见性，再建设故障模拟、回收、复制、控制面、EC 和客户端适配。但当前计划过早把多个尚未冻结的语义绑定在一起，不能直接作为十个连续 coding 批次执行。
 
-当前仓库已有 `cairn-core`、`cairn-device`、`cairn-ec`、`cairn-sim` 以及纯内存差分参考模型 `cairn-model`；尚无真实 `FileDevice`、控制面、placement 或复制实现。因此下一步仍应先完成单节点 Gate 1 和进程内模拟 gate，而不是铺开真实集群 crate。
+当前仓库已有 `cairn-core`、`cairn-device`、`cairn-ec`、`cairn-sim`、真实文件后端 `FileDevice` 以及纯内存差分参考模型 `cairn-model`；仍无 DAG 回收、控制面、placement 或复制实现。因此下一步仍应先完成单节点 DAG Gate 1 和进程内模拟 gate，而不是铺开真实集群 crate。
 
 ## 已确认的数学错误
 
@@ -42,13 +42,13 @@ Reed–Solomon 的 `k+m` 配置共有 `k+m` 个 shard，任意 `k` 个有效 sha
 
 ## 建议的重新排序
 
-1. 冻结 `cairn-types`、`cairn-codec`、错误模型和 root/commit 语义；明确 EC 参数命名。
+1. 冻结 `cairn-types`、`cairn-codec`、错误模型和 DAG root/commit 语义；明确 EC 参数命名。
 2. 完成 SimDisk 的 bounded fault schedule，并用性质测试枚举 write/flush/crash 边界。
-3. 完成 record scanner、双 superblock、完整 generation 回退、FileDevice 和差分模型。
-4. 完成 chunk/manifest 流式 API、GC 和 checkpoint；证明索引损坏不影响正确性。
+3. 完成 record scanner、双 superblock、完整 generation 回退、FileDevice 的显式契约 gate 和差分模型。
+4. 完成 chunk/manifest DAG 流式 API、可达性回收和 checkpoint；证明索引损坏不影响正确性。
 5. 单独实现并验证 `cairn-ec`：先测 codec 的任意 `k` 有效 shard、checksum 排除和超过容错数失败。
 6. 再实现 placement 与 failure-domain contract，随后才实现三副本和 repair。
-7. 最后建设控制面、网络协议、统一事务和进程内集群测试。
+7. 最后建设控制面、网络协议、统一事务和进程内集群测试；S3/对象 API 只能作为上层适配器单独验收。
 
 ## Gate 0：在继续扩展前必须补齐
 

@@ -14,9 +14,10 @@ temporary file, raw device, or filesystem-backed `FileDevice`. The default test
 path uses `SimDisk` and `SimNetwork` only. This protects SSD lifetime and keeps
 tests reproducible.
 
-Real file durability checks are explicit opt-in smoke tests, bounded in count
-and size, and must clean up their files. Raw-device experiments are not part of
-the first implementation.
+Real file visibility and recovery checks are explicit opt-in contract tests,
+bounded in count and size, and must clean up their files. They are not part of
+the default workspace gate and do not claim to simulate power loss. Raw-device
+experiments are not part of the first implementation.
 
 ## Virtual time
 
