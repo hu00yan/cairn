@@ -1,9 +1,10 @@
 #![deny(unsafe_code)]
 use cairn_device::{BlockDevice, DeviceError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub type ObjectId = [u8; 32];
 pub type Generation = u64;
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 pub const SLOT_SIZE: u64 = 4096;
 pub const RECORDS_START: u64 = SLOT_SIZE * 2;
 const H: usize = 32;
@@ -12,6 +13,10 @@ const MAGIC: u32 = 0x4341_4952;
 const SMAGIC: u32 = 0x4341_5350;
 const VERSION: u16 = 2;
 const MAX: u64 = 64 * 1024 * 1024;
+const MANIFEST_HEADER_SIZE: usize = 16;
+const MANIFEST_CHUNK_REF_SIZE: usize = 36;
+const MAX_MANIFEST_CHUNKS: usize =
+    ((MAX - 32 - MANIFEST_HEADER_SIZE as u64) / MANIFEST_CHUNK_REF_SIZE as u64) as usize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkRef {
@@ -45,7 +50,9 @@ pub enum Error {
     Device(DeviceError),
     Corruption(&'static str),
     NotFound(ObjectId),
+    WrongObjectKind(&'static str),
     InvalidInput(&'static str),
+    Capacity,
     ResourceExhausted(&'static str),
     Unformatted,
     UnsupportedFormat,
@@ -133,6 +140,19 @@ fn manifest_id(body: &[u8]) -> ObjectId {
     let mut h = blake3::Hasher::new();
     h.update(b"cairn/manifest/v1\0");
     h.update(body);
+    *h.finalize().as_bytes()
+}
+fn manifest_id_for_chunks(chunks: &[ChunkRef], total: u64) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"cairn/manifest/v1\0");
+    h.update(&1u16.to_le_bytes());
+    h.update(&0u16.to_le_bytes());
+    h.update(&(chunks.len() as u32).to_le_bytes());
+    h.update(&total.to_le_bytes());
+    for chunk in chunks {
+        h.update(&chunk.id);
+        h.update(&chunk.len.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 fn align(n: u64) -> Result<u64, Error> {
@@ -362,7 +382,10 @@ impl<D: BlockDevice> Store<D> {
                     manifest: s.manifest,
                 });
                 if let Err(e) = st.validate_manifest(&s.manifest) {
-                    if !matches!(e, Error::Corruption(_) | Error::NotFound(_)) {
+                    if !matches!(
+                        e,
+                        Error::Corruption(_) | Error::NotFound(_) | Error::WrongObjectKind(_)
+                    ) {
                         return Err(e);
                     }
                     continue;
@@ -390,20 +413,123 @@ impl<D: BlockDevice> Store<D> {
         };
         let id = chunk_id(data);
         if self.index.contains_key(&id) {
+            let entry = *self.index.get(&id).unwrap();
+            if entry.kind != Kind::Chunk {
+                return Err(Error::Corruption("object id collision"));
+            }
+            self.validate_chunk_ref(&id, data.len() as u32)?;
             return Ok(id);
         };
-        let mut p = Vec::with_capacity(32 + data.len());
+        let mut p = Vec::new();
+        p.try_reserve_exact(32 + data.len())
+            .map_err(|_| Error::ResourceExhausted("chunk allocation failed"))?;
         p.extend_from_slice(&id);
         p.extend_from_slice(data);
-        if let Err(e) = self.append(Kind::Chunk, &p, 0) {
-            self.requires_recovery = true;
-            return Err(e);
+        match self.append(Kind::Chunk, &p, 0) {
+            Ok(_) => Ok(id),
+            Err(Error::Capacity) => Err(Error::Capacity),
+            Err(e) => {
+                self.requires_recovery = true;
+                Err(e)
+            }
         }
-        Ok(id)
+    }
+
+    pub fn put_object(&mut self, data: &[u8]) -> Result<ObjectId, Error> {
+        self.put_object_with_chunk_size(data, DEFAULT_CHUNK_SIZE)
+    }
+
+    pub fn put_object_with_chunk_size(
+        &mut self,
+        data: &[u8],
+        chunk_size: usize,
+    ) -> Result<ObjectId, Error> {
+        if self.requires_recovery {
+            return Err(Error::RequiresRecovery);
+        }
+        if chunk_size == 0 {
+            return Err(Error::InvalidInput("chunk size must be non-zero"));
+        }
+        if chunk_size > u32::MAX as usize {
+            return Err(Error::InvalidInput("chunk size exceeds manifest limit"));
+        }
+        let chunk_count = data.len().div_ceil(chunk_size);
+        if chunk_count > MAX_MANIFEST_CHUNKS {
+            return Err(Error::InvalidInput("manifest too large"));
+        }
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(chunk_count)
+            .map_err(|_| Error::ResourceExhausted("chunk index allocation failed"))?;
+        let mut new_chunk_ids = HashSet::new();
+        new_chunk_ids
+            .try_reserve(chunk_count)
+            .map_err(|_| Error::ResourceExhausted("chunk deduplication allocation failed"))?;
+        let mut required_end = self.append_offset;
+        for bytes in data.chunks(chunk_size) {
+            let id = chunk_id(bytes);
+            chunks.push(ChunkRef {
+                id,
+                len: bytes.len() as u32,
+            });
+            if !self.index.contains_key(&id) && new_chunk_ids.insert(id) {
+                required_end = required_end
+                    .checked_add(record_span(32 + bytes.len())?)
+                    .ok_or(Error::Capacity)?;
+            }
+        }
+        let total = chunks
+            .iter()
+            .try_fold(0u64, |sum, chunk| sum.checked_add(u64::from(chunk.len)))
+            .ok_or(Error::InvalidInput("manifest overflow"))?;
+        let manifest_id = manifest_id_for_chunks(&chunks, total);
+        let manifest_exists = match self.index.get(&manifest_id) {
+            None => false,
+            Some(entry) if entry.kind == Kind::Manifest => true,
+            Some(_) => return Err(Error::Corruption("object id collision")),
+        };
+        if manifest_exists {
+            self.validate_manifest_record(&manifest_id)?;
+        }
+        for chunk in &chunks {
+            if self.index.contains_key(&chunk.id) {
+                self.validate_chunk_ref(&chunk.id, chunk.len)?;
+            }
+        }
+        let manifest_payload_len = 32usize
+            .checked_add(MANIFEST_HEADER_SIZE)
+            .and_then(|value| {
+                chunk_count
+                    .checked_mul(MANIFEST_CHUNK_REF_SIZE)
+                    .and_then(|refs| value.checked_add(refs))
+            })
+            .ok_or(Error::InvalidInput("manifest too large"))?;
+        if !manifest_exists {
+            required_end = required_end
+                .checked_add(record_span(manifest_payload_len)?)
+                .ok_or(Error::Capacity)?;
+        }
+        if required_end > self.device.len() {
+            return Err(Error::Capacity);
+        }
+        self.index
+            .try_reserve(
+                new_chunk_ids
+                    .len()
+                    .saturating_add(usize::from(!manifest_exists)),
+            )
+            .map_err(|_| Error::ResourceExhausted("object index allocation failed"))?;
+        for bytes in data.chunks(chunk_size) {
+            self.put_bytes(bytes)?;
+        }
+        self.put_manifest(&chunks)
     }
     pub fn put_manifest(&mut self, chunks: &[ChunkRef]) -> Result<ObjectId, Error> {
         if self.requires_recovery {
             return Err(Error::RequiresRecovery);
+        }
+        if chunks.len() > MAX_MANIFEST_CHUNKS {
+            return Err(Error::InvalidInput("manifest too large"));
         }
         let count =
             u32::try_from(chunks.len()).map_err(|_| Error::InvalidInput("too many chunks"))?;
@@ -424,7 +550,7 @@ impl<D: BlockDevice> Store<D> {
         }
         let mut body = Vec::new();
         body.try_reserve_exact(n)
-            .map_err(|_| Error::InvalidInput("manifest too large"))?;
+            .map_err(|_| Error::ResourceExhausted("manifest allocation failed"))?;
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&count.to_le_bytes());
@@ -434,16 +560,26 @@ impl<D: BlockDevice> Store<D> {
             body.extend_from_slice(&c.len.to_le_bytes())
         }
         let id = manifest_id(&body);
+        if let Some(entry) = self.index.get(&id) {
+            if entry.kind == Kind::Manifest {
+                self.validate_manifest_record(&id)?;
+                return Ok(id);
+            }
+            return Err(Error::Corruption("object id collision"));
+        }
         let mut p = Vec::new();
         p.try_reserve_exact(32 + n)
-            .map_err(|_| Error::InvalidInput("manifest too large"))?;
+            .map_err(|_| Error::ResourceExhausted("manifest allocation failed"))?;
         p.extend_from_slice(&id);
         p.extend_from_slice(&body);
-        if let Err(e) = self.append(Kind::Manifest, &p, 0) {
-            self.requires_recovery = true;
-            return Err(e);
+        match self.append(Kind::Manifest, &p, 0) {
+            Ok(_) => Ok(id),
+            Err(Error::Capacity) => Err(Error::Capacity),
+            Err(e) => {
+                self.requires_recovery = true;
+                Err(e)
+            }
         }
-        Ok(id)
     }
     pub fn get_bytes(&mut self, id: &ObjectId) -> Result<Vec<u8>, Error> {
         let e = *self.index.get(id).ok_or(Error::NotFound(*id))?;
@@ -454,7 +590,12 @@ impl<D: BlockDevice> Store<D> {
         if p.len() < 32 || p[..32] != id[..] || chunk_id(&p[32..]) != *id {
             return Err(Error::Corruption("chunk hash"));
         };
-        Ok(p[32..].to_vec())
+        let payload_len = p.len() - 32;
+        let mut data = Vec::new();
+        data.try_reserve_exact(payload_len)
+            .map_err(|_| Error::ResourceExhausted("chunk allocation failed"))?;
+        data.extend_from_slice(&p[32..]);
+        Ok(data)
     }
 
     pub fn get_manifest(&mut self, id: &ObjectId) -> Result<Object, Error> {
@@ -465,7 +606,11 @@ impl<D: BlockDevice> Store<D> {
         let Some(root) = self.root.clone() else {
             return Ok(None);
         };
-        let object = self.read_manifest(&root.manifest)?;
+        self.read_object(&root.manifest).map(Some)
+    }
+
+    pub fn read_object(&mut self, id: &ObjectId) -> Result<Vec<u8>, Error> {
+        let object = self.read_manifest(id)?;
         let capacity = usize::try_from(object.len)
             .map_err(|_| Error::ResourceExhausted("object length does not fit usize"))?;
         let mut bytes = Vec::new();
@@ -482,7 +627,7 @@ impl<D: BlockDevice> Store<D> {
         if bytes.len() as u64 != object.len {
             return Err(Error::Corruption("object length mismatch"));
         }
-        Ok(Some(bytes))
+        Ok(bytes)
     }
     pub fn commit_root(
         &mut self,
@@ -515,6 +660,7 @@ impl<D: BlockDevice> Store<D> {
         p.extend_from_slice(&generation.to_le_bytes());
         let off = match self.append(Kind::Root, &p, generation) {
             Ok(x) => x,
+            Err(Error::Capacity) => return Err(Error::Capacity),
             Err(e) => {
                 self.requires_recovery = true;
                 return Err(e);
@@ -547,25 +693,60 @@ impl<D: BlockDevice> Store<D> {
         Ok(r)
     }
     pub fn validate_manifest(&mut self, id: &ObjectId) -> Result<(), Error> {
-        self.read_manifest(id).map(|_| ())
+        let p = self.read_manifest_payload(id)?;
+        let body = &p[32..];
+        let (count, total) = Self::manifest_layout(body)?;
+        self.validate_manifest_chunks(body, count, total)
+    }
+
+    fn validate_manifest_record(&mut self, id: &ObjectId) -> Result<(), Error> {
+        let p = self.read_manifest_payload(id)?;
+        Self::manifest_layout(&p[32..]).map(|_| ())
     }
 
     fn read_manifest(&mut self, id: &ObjectId) -> Result<Object, Error> {
         let id = *id;
+        let p = self.read_manifest_payload(&id)?;
+        let body = &p[32..];
+        let (count, total) = Self::manifest_layout(body)?;
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(count)
+            .map_err(|_| Error::ResourceExhausted("manifest index allocation failed"))?;
+        for i in 0..count {
+            let a = MANIFEST_HEADER_SIZE + i * MANIFEST_CHUNK_REF_SIZE;
+            let cid: ObjectId = body[a..a + 32].try_into().unwrap();
+            let len = u32::from_le_bytes(body[a + 32..a + 36].try_into().unwrap());
+            self.validate_chunk_ref(&cid, len)?;
+            chunks.push(ChunkRef { id: cid, len });
+        }
+        Ok(Object {
+            id,
+            len: total,
+            chunks,
+        })
+    }
+    fn read_manifest_payload(&mut self, id: &ObjectId) -> Result<Vec<u8>, Error> {
+        let id = *id;
         let e = *self.index.get(&id).ok_or(Error::NotFound(id))?;
         if e.kind != Kind::Manifest {
-            return Err(Error::Corruption("root not manifest"));
+            return Err(Error::WrongObjectKind("manifest"));
         }
         let (_, p) = self.read(e.offset)?;
-        if p.len() < 48 || manifest_id(&p[32..]) != id {
+        if p.len() < 32 + MANIFEST_HEADER_SIZE || manifest_id(&p[32..]) != id {
             return Err(Error::Corruption("manifest hash"));
         }
-        let body = &p[32..];
+        Ok(p)
+    }
+    fn manifest_layout(body: &[u8]) -> Result<(usize, u64), Error> {
+        if body.len() < MANIFEST_HEADER_SIZE {
+            return Err(Error::Corruption("manifest format"));
+        }
         let count = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
-        let need = 16usize
+        let need = MANIFEST_HEADER_SIZE
             .checked_add(
                 count
-                    .checked_mul(36)
+                    .checked_mul(MANIFEST_CHUNK_REF_SIZE)
                     .ok_or(Error::Corruption("manifest count"))?,
             )
             .ok_or(Error::Corruption("manifest length"))?;
@@ -573,40 +754,43 @@ impl<D: BlockDevice> Store<D> {
             return Err(Error::Corruption("manifest format"));
         }
         let total = u64::from_le_bytes(body[8..16].try_into().unwrap());
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(count)
-            .map_err(|_| Error::ResourceExhausted("manifest index allocation failed"))?;
+        Ok((count, total))
+    }
+    fn validate_manifest_chunks(
+        &mut self,
+        body: &[u8],
+        count: usize,
+        total: u64,
+    ) -> Result<(), Error> {
         let mut sum = 0u64;
         for i in 0..count {
-            let a = 16 + i * 36;
+            let a = MANIFEST_HEADER_SIZE + i * MANIFEST_CHUNK_REF_SIZE;
             let cid: ObjectId = body[a..a + 32].try_into().unwrap();
             let len = u32::from_le_bytes(body[a + 32..a + 36].try_into().unwrap());
             sum = sum
                 .checked_add(u64::from(len))
                 .ok_or(Error::Corruption("manifest total"))?;
-            let ce = *self.index.get(&cid).ok_or(Error::NotFound(cid))?;
-            if ce.kind != Kind::Chunk {
-                return Err(Error::Corruption("manifest kind"));
-            }
-            let (_, cp) = self.read(ce.offset)?;
-            if cp.len() < 32
-                || cp.len() - 32 != len as usize
-                || cp[..32] != cid
-                || chunk_id(&cp[32..]) != cid
-            {
-                return Err(Error::Corruption("manifest chunk"));
-            }
-            chunks.push(ChunkRef { id: cid, len });
+            self.validate_chunk_ref(&cid, len)?;
         }
         if sum != total {
             return Err(Error::Corruption("manifest total mismatch"));
         }
-        Ok(Object {
-            id,
-            len: total,
-            chunks,
-        })
+        Ok(())
+    }
+    fn validate_chunk_ref(&mut self, id: &ObjectId, len: u32) -> Result<(), Error> {
+        let e = *self.index.get(id).ok_or(Error::NotFound(*id))?;
+        if e.kind != Kind::Chunk {
+            return Err(Error::Corruption("manifest kind"));
+        }
+        let (_, p) = self.read(e.offset)?;
+        if p.len() < 32
+            || p.len() - 32 != len as usize
+            || p[..32] != id[..]
+            || chunk_id(&p[32..]) != *id
+        {
+            return Err(Error::Corruption("manifest chunk"));
+        }
+        Ok(())
     }
     fn append(&mut self, kind: Kind, p: &[u8], generation: u64) -> Result<u64, Error> {
         if p.len() > MAX as usize {
@@ -623,19 +807,32 @@ impl<D: BlockDevice> Store<D> {
         let end = at
             .checked_add((H + p.len()) as u64)
             .ok_or(Error::InvalidInput("offset overflow"))?;
-        if end > self.device.len() {
-            return Err(Error::InvalidInput("device full"));
+        let next = align(end)?;
+        if next > self.device.len() {
+            return Err(Error::Capacity);
         };
+        let object_id = if matches!(kind, Kind::Chunk | Kind::Manifest) {
+            Some(
+                p.get(..32)
+                    .ok_or(Error::InvalidInput("object id"))?
+                    .try_into()
+                    .map_err(|_| Error::InvalidInput("object id"))?,
+            )
+        } else {
+            None
+        };
+        if let Some(id) = object_id {
+            if !self.index.contains_key(&id) {
+                self.index
+                    .try_reserve(1)
+                    .map_err(|_| Error::ResourceExhausted("object index allocation failed"))?;
+            }
+        }
         self.device.write_at(at, &h.encode())?;
         self.device.write_at(at + H as u64, p)?;
         self.device.flush_data()?;
-        self.append_offset = align(end)?;
-        if matches!(kind, Kind::Chunk | Kind::Manifest) {
-            let id: ObjectId = p
-                .get(..32)
-                .ok_or(Error::InvalidInput("object id"))?
-                .try_into()
-                .map_err(|_| Error::InvalidInput("object id"))?;
+        self.append_offset = next;
+        if let Some(id) = object_id {
             self.index.entry(id).or_insert(Entry {
                 offset: at,
                 kind,
@@ -663,7 +860,11 @@ impl<D: BlockDevice> Store<D> {
         if end > self.device.len() {
             return Err(Error::Corruption("truncated record"));
         };
-        let mut p = vec![0; h.len as usize];
+        let payload_len = h.len as usize;
+        let mut p = Vec::new();
+        p.try_reserve_exact(payload_len)
+            .map_err(|_| Error::ResourceExhausted("record payload allocation failed"))?;
+        p.resize(payload_len, 0);
         self.device.read_at(off + H as u64, &mut p)?;
         if u64::from_le_bytes(digest(&h, &p)[..8].try_into().unwrap()) != h.checksum {
             return Err(Error::Corruption("record checksum"));
@@ -683,11 +884,22 @@ impl<D: BlockDevice> Store<D> {
                     return Err(Error::Corruption("object payload"));
                 };
                 let id: ObjectId = p[..32].try_into().unwrap();
-                self.index.entry(id).or_insert(Entry {
-                    offset: o,
-                    kind: h.kind,
-                    len: h.len,
-                });
+                let valid = match h.kind {
+                    Kind::Chunk => chunk_id(&p[32..]) == id,
+                    Kind::Manifest => manifest_id(&p[32..]) == id,
+                    Kind::Root => false,
+                };
+                if !valid {
+                    return Err(Error::Corruption("object hash"));
+                }
+                self.index_record(
+                    id,
+                    Entry {
+                        offset: o,
+                        kind: h.kind,
+                        len: h.len,
+                    },
+                )?;
             }
             o = next
         }
@@ -717,6 +929,23 @@ impl<D: BlockDevice> Store<D> {
         }
         Ok(o)
     }
+    fn index_record(&mut self, id: ObjectId, entry: Entry) -> Result<(), Error> {
+        if self.index.contains_key(&id) {
+            return Ok(());
+        }
+        self.index
+            .try_reserve(1)
+            .map_err(|_| Error::ResourceExhausted("object index allocation failed"))?;
+        self.index.insert(id, entry);
+        Ok(())
+    }
+}
+
+fn record_span(payload_len: usize) -> Result<u64, Error> {
+    let bytes = H
+        .checked_add(payload_len)
+        .ok_or(Error::InvalidInput("record size overflow"))?;
+    align(u64::try_from(bytes).map_err(|_| Error::InvalidInput("record size overflow"))?)
 }
 
 #[cfg(test)]
@@ -766,6 +995,156 @@ mod tests {
 
         let mut reopened = Store::open(store.into_device()).unwrap();
         assert_eq!(reopened.read_root().unwrap(), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn chunked_put_and_object_read_round_trip() {
+        let data: Vec<u8> = (0..2500).map(|index| (index % 251) as u8).collect();
+        let mut store = Store::format(disk()).unwrap();
+        let manifest = store.put_object_with_chunk_size(&data, 1000).unwrap();
+        let object = store.get_manifest(&manifest).unwrap();
+        assert_eq!(object.chunks.len(), 3);
+        assert_eq!(store.read_object(&manifest).unwrap(), data);
+        store.commit_root(manifest, 1).unwrap();
+        let mut reopened = Store::open(store.into_device()).unwrap();
+        assert_eq!(reopened.read_root().unwrap(), Some(data));
+    }
+
+    #[test]
+    fn chunked_put_rejects_zero_chunk_size_before_writing() {
+        let mut store = Store::format(disk()).unwrap();
+        assert!(matches!(
+            store.put_object_with_chunk_size(b"data", 0),
+            Err(Error::InvalidInput("chunk size must be non-zero"))
+        ));
+        assert_eq!(store.put_object(b"data").unwrap().len(), 32);
+    }
+
+    #[test]
+    fn chunked_put_rejects_unencodable_manifest_before_writing() {
+        let mut store = Store::format(disk()).unwrap();
+        let before = store.append_offset;
+        let data = vec![0u8; MAX_MANIFEST_CHUNKS + 1];
+        assert!(matches!(
+            store.put_object_with_chunk_size(&data, 1),
+            Err(Error::InvalidInput("manifest too large"))
+        ));
+        assert_eq!(store.append_offset, before);
+    }
+
+    #[test]
+    fn chunked_put_rejects_capacity_before_writing_and_remains_usable() {
+        let mut store = Store::format(SimDisk::new(16 * 1024)).unwrap();
+        let before = store.append_offset;
+        let data: Vec<u8> = (0..12 * 1024).map(|index| (index / 4096) as u8).collect();
+        assert!(matches!(
+            store.put_object_with_chunk_size(&data, 4 * 1024),
+            Err(Error::Capacity)
+        ));
+        assert_eq!(store.append_offset, before);
+        assert!(!store.requires_recovery);
+        let manifest = store.put_object(b"ok").unwrap();
+        assert_eq!(store.read_object(&manifest).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn read_object_rejects_a_chunk_id_as_the_wrong_object_kind() {
+        let mut store = Store::format(disk()).unwrap();
+        let chunk = store.put_bytes(b"chunk").unwrap();
+        assert!(matches!(
+            store.read_object(&chunk),
+            Err(Error::WrongObjectKind("manifest"))
+        ));
+    }
+
+    #[test]
+    fn repeated_object_put_deduplicates_the_manifest_record() {
+        let mut store = Store::format(SimDisk::new(16 * 1024)).unwrap();
+        let data = vec![0x5a; 4096];
+        let first = store.put_object(&data).unwrap();
+        store.put_bytes(&vec![0xa5; 3800]).unwrap();
+        let end = store.append_offset;
+        assert_eq!(store.put_object(&data).unwrap(), first);
+        assert_eq!(store.append_offset, end);
+    }
+
+    #[test]
+    fn chunked_put_preserves_requires_recovery_before_validating_inputs() {
+        let disk = SimDisk::from_script(
+            256 * 1024,
+            DeviceScript {
+                rules: vec![DeviceRule {
+                    selector: EventSelector {
+                        kind: DeviceEventKind::Write,
+                        occurrence: EventOccurrence::Exact(3),
+                        range: None,
+                    },
+                    effect: DeviceEffect::CrashBefore,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut store = Store::format(disk).unwrap();
+        assert!(store.put_bytes(b"poison").is_err());
+        assert!(matches!(
+            store.put_object_with_chunk_size(b"data", 0),
+            Err(Error::RequiresRecovery)
+        ));
+    }
+
+    #[test]
+    fn deduplication_does_not_trust_a_corrupted_index_entry() {
+        let mut store = Store::format(disk()).unwrap();
+        let chunk = store.put_bytes(b"chunk").unwrap();
+        let manifest = store
+            .put_manifest(&[ChunkRef { id: chunk, len: 5 }])
+            .unwrap();
+        store.commit_root(manifest, 1).unwrap();
+        let other = store.put_manifest(&[]).unwrap();
+        store.commit_root(other, 2).unwrap();
+        let other_entry = *store.index.get(&other).unwrap();
+        store.index.insert(manifest, other_entry);
+        assert!(matches!(
+            store.put_manifest(&[ChunkRef { id: chunk, len: 5 }]),
+            Err(Error::Corruption("manifest hash"))
+        ));
+    }
+
+    #[test]
+    fn direct_capacity_rejections_do_not_poison_the_store() {
+        let mut store = Store::format(SimDisk::new(16 * 1024)).unwrap();
+        let full_chunk = vec![0x7f; 8050];
+        store.put_bytes(&full_chunk).unwrap();
+        assert!(matches!(store.put_manifest(&[]), Err(Error::Capacity)));
+        assert!(!store.requires_recovery);
+        store.put_bytes(b"x").unwrap();
+
+        let mut store = Store::format(SimDisk::new(16 * 1024)).unwrap();
+        let chunk = store.put_bytes(b"root").unwrap();
+        let manifest = store
+            .put_manifest(&[ChunkRef { id: chunk, len: 4 }])
+            .unwrap();
+        store.put_bytes(&vec![0x23; 7900]).unwrap();
+        assert!(matches!(
+            store.commit_root(manifest, 1),
+            Err(Error::Capacity)
+        ));
+        assert!(!store.requires_recovery);
+    }
+
+    #[test]
+    fn chunked_put_boundary_matrix_round_trips() {
+        for chunk_size in [1usize, 2, 3, 7, 16, 1024] {
+            for len in 0..=33usize {
+                let data: Vec<u8> = (0..len)
+                    .map(|index| (index as u8).wrapping_mul(17))
+                    .collect();
+                let mut store = Store::format(disk()).unwrap();
+                let manifest = store.put_object_with_chunk_size(&data, chunk_size).unwrap();
+                assert_eq!(store.read_object(&manifest).unwrap(), data);
+            }
+        }
     }
 
     #[test]

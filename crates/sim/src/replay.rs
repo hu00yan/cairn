@@ -609,6 +609,7 @@ fn compare_rejections(
 
 fn core_rejection_reason(error: &CoreError, context: RejectionContext) -> Option<RejectionReason> {
     match error {
+        CoreError::Capacity => Some(RejectionReason::Capacity),
         CoreError::InvalidInput(message) if *message == "device full" => {
             Some(RejectionReason::Capacity)
         }
@@ -627,6 +628,7 @@ fn core_rejection_reason(error: &CoreError, context: RejectionContext) -> Option
                 Some(RejectionReason::InvalidInput)
             }
         }
+        CoreError::WrongObjectKind(_) => Some(RejectionReason::InvalidInput),
         CoreError::Device(_)
         | CoreError::RequiresRecovery
         | CoreError::ResourceExhausted(_)
@@ -980,6 +982,7 @@ fn divergence(step: usize, detail: &str) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_device::{DeviceEffect, DeviceEventKind, EventOccurrence, EventSelector};
 
     #[test]
     fn manifest_probe_distinguishes_hidden_and_missing_chunk() {
@@ -1008,5 +1011,54 @@ mod tests {
             probe_manifest(&device, [0; 32]).unwrap(),
             ManifestVisibility::Hidden
         );
+    }
+
+    #[test]
+    fn chunked_put_crash_matrix_preserves_the_last_committed_root() {
+        for occurrence in [20, 21, 23, 24, 26, 27, 29, 30, 32, 33, 45, 46, 50] {
+            let disk = SimDisk::from_script(
+                256 * 1024,
+                DeviceScript {
+                    rules: vec![DeviceRule {
+                        selector: EventSelector {
+                            kind: DeviceEventKind::Write,
+                            occurrence: EventOccurrence::Exact(occurrence),
+                            range: None,
+                        },
+                        effect: DeviceEffect::CrashBefore,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut store = Store::format(disk).unwrap();
+            let old_data = b"committed root".to_vec();
+            let old_chunk = store.put_bytes(&old_data).unwrap();
+            let old_manifest = store
+                .put_manifest(&[CoreChunkRef {
+                    id: old_chunk,
+                    len: old_data.len() as u32,
+                }])
+                .unwrap();
+            store.commit_root(old_manifest, 1).unwrap();
+            let data: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+            let result = store.put_object_with_chunk_size(&data, 1024);
+            if occurrence <= 33 {
+                assert!(result.is_err(), "write occurrence {occurrence}");
+            } else {
+                let manifest = result.unwrap();
+                assert!(
+                    store.commit_root(manifest, 2).is_err(),
+                    "write occurrence {occurrence}"
+                );
+            }
+            let mut disk = store.into_device();
+            let hits = disk.script_rule_hits();
+            assert!(hits.lock().unwrap()[0], "write occurrence {occurrence}");
+            disk.power_loss();
+            let mut reopened = Store::open(disk).unwrap();
+            assert_eq!(reopened.current_root().unwrap().generation, 1);
+            assert_eq!(reopened.read_root().unwrap(), Some(old_data));
+        }
     }
 }
