@@ -1,4 +1,13 @@
+pub mod catalog;
 pub mod dag;
+
+pub use catalog::{
+    Candidate, Capability, CatalogError, Collection, CollectionId, CommitId, CommitReceipt,
+    DagOperationIndexEntry, File, FileId, FileVersion, Generation as CatalogGeneration, Head,
+    IndexState, IntentState, Membership, ModelCatalog, Operation, OperationId, OperationKind,
+    OperationRecord, OperationResult, Principal, PrincipalId, PrincipalKind, PrincipalState,
+    PublishIntent, VersionId,
+};
 
 pub use dag::{
     content_digest, decode_node, encode_node_payload, node_id, CommitNode, ContentNode, Dag,
