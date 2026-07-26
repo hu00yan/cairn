@@ -10,6 +10,10 @@ macro_rules! id {
         )]
         pub struct $n(u64);
         impl $n {
+            pub const fn from_raw(value: u64) -> Self {
+                Self(value)
+            }
+
             pub fn get(self) -> u64 {
                 self.0
             }

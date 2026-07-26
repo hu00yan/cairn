@@ -319,7 +319,7 @@ CREATE TABLE IF NOT EXISTS operations (
 // Sol schema v1 adapter.  The legacy module above is kept private only to
 // make this uncommitted adapter migration easy to review; all public names
 // below are the current API.
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 
 pub const DAG_DURABILITY_SEAM: &str =
@@ -381,6 +381,20 @@ pub struct CatalogVersion {
     pub parent_version_id: Option<u64>,
     pub size: u64,
     pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogOperationState {
+    InProgress,
+    Succeeded,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadAuthorization {
+    Missing,
+    Unauthorized,
+    NotPublished,
+    Authorized,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadRecord {
@@ -525,8 +539,8 @@ pub struct SqliteCatalogStore {
     connection: Connection,
 }
 
-fn validate_schema_v1(connection: &Connection) -> rusqlite::Result<()> {
-    for statement in SCHEMA_V1.split(';') {
+fn validate_schema_v2(connection: &Connection) -> rusqlite::Result<()> {
+    for statement in SCHEMA_V2.split(';') {
         let statement = statement.trim();
         let Some(rest) = statement.strip_prefix("CREATE TABLE IF NOT EXISTS ") else {
             continue;
@@ -562,7 +576,7 @@ impl SqliteCatalogStore {
     pub fn in_memory() -> rusqlite::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?, false)
     }
-    fn from_connection(connection: Connection, require_wal: bool) -> rusqlite::Result<Self> {
+    fn from_connection(mut connection: Connection, require_wal: bool) -> rusqlite::Result<Self> {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -577,16 +591,33 @@ impl SqliteCatalogStore {
         if !journal_ok || synchronous != 2 || foreign_keys != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        connection.execute_batch(SCHEMA_V1)?;
+        let has_catalog_meta: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_any_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_catalog_meta && has_any_table {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if !has_catalog_meta {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.commit()?;
+        }
         let schema_version: u64 = connection.query_row(
             "SELECT schema_version FROM catalog_meta WHERE id = 1",
             [],
             |row| row.get(0),
         )?;
-        if schema_version != 1 {
+        if schema_version != 2 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        validate_schema_v1(&connection)?;
+        validate_schema_v2(&connection)?;
         Ok(Self { connection })
     }
     fn with_immediate_transaction<T>(
@@ -654,6 +685,147 @@ impl SqliteCatalogStore {
                 },
             )
             .optional()
+    }
+    pub fn authorize_read_version(&self, actor_id: u64, version_id: u64) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM file_versions AS v
+                JOIN files AS f ON f.id=v.file_id
+                JOIN collections AS c ON c.id=f.collection_id
+                JOIN principal AS p ON p.id=?1 AND p.state='active'
+                WHERE v.id=?2 AND (c.owner_id=?1 OR EXISTS(
+                    SELECT 1 FROM membership AS m
+                    WHERE m.organization_id=c.owner_id AND m.member_id=?1
+                      AND m.capability IN ('read','write','manage_members')
+                ))
+                AND EXISTS(
+                    SELECT 1 FROM publish_intents AS i
+                    WHERE i.candidate_version_id=v.id AND i.state='published'
+                )
+            )",
+            params![actor_id, version_id],
+            |r| r.get(0),
+        )
+    }
+    pub fn read_authorization(
+        &self,
+        actor_id: u64,
+        file_id: u64,
+        version_id: u64,
+    ) -> rusqlite::Result<ReadAuthorization> {
+        self.connection.query_row(
+            "SELECT CASE
+                WHEN NOT EXISTS(SELECT 1 FROM file_versions WHERE id=?2 AND file_id=?3) THEN 'missing'
+                WHEN NOT EXISTS(
+                    SELECT 1 FROM file_versions AS v
+                    JOIN files AS f ON f.id=v.file_id
+                    JOIN collections AS c ON c.id=f.collection_id
+                    JOIN principal AS p ON p.id=?1 AND p.state='active'
+                    WHERE v.id=?2 AND v.file_id=?3 AND (c.owner_id=?1 OR EXISTS(
+                        SELECT 1 FROM membership AS m
+                        WHERE m.organization_id=c.owner_id AND m.member_id=?1
+                          AND m.capability IN ('read','write','manage_members')
+                    ))
+                ) THEN 'unauthorized'
+                WHEN NOT EXISTS(SELECT 1 FROM publish_intents WHERE candidate_version_id=?2 AND state='published') THEN 'not_published'
+                ELSE 'authorized' END",
+            params![actor_id, version_id, file_id],
+            |r| match r.get::<_, String>(0)?.as_str() {
+                "missing" => Ok(ReadAuthorization::Missing),
+                "unauthorized" => Ok(ReadAuthorization::Unauthorized),
+                "not_published" => Ok(ReadAuthorization::NotPublished),
+                "authorized" => Ok(ReadAuthorization::Authorized),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            },
+        )
+    }
+    pub fn version_is_published(&self, version_id: u64) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publish_intents WHERE candidate_version_id=?1 AND state='published')",
+            [version_id],
+            |r| r.get(0),
+        )
+    }
+    pub fn operation_state(
+        &self,
+        actor_id: u64,
+        operation_id: u64,
+    ) -> rusqlite::Result<Option<CatalogOperationState>> {
+        self.connection
+            .query_row(
+                "SELECT state FROM operation_results WHERE operation_id=?1 AND actor_id=?2",
+                params![operation_id, actor_id],
+                |r| {
+                    Ok(match r.get::<_, String>(0)?.as_str() {
+                        "succeeded" => CatalogOperationState::Succeeded,
+                        "failed" => CatalogOperationState::Failed,
+                        "in_progress" => CatalogOperationState::InProgress,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    })
+                },
+            )
+            .optional()
+    }
+    pub fn acquire_reader_lease(
+        &mut self,
+        actor_id: u64,
+        file_id: u64,
+        version_id: u64,
+        coordinator_epoch: u64,
+    ) -> rusqlite::Result<u64> {
+        self.with_immediate_transaction(|tx| {
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM file_versions AS v
+                    JOIN files AS f ON f.id=v.file_id
+                    JOIN collections AS c ON c.id=f.collection_id
+                    JOIN principal AS p ON p.id=?1 AND p.state='active'
+                    WHERE v.id=?3 AND v.file_id=?2 AND (c.owner_id=?1 OR EXISTS(
+                        SELECT 1 FROM membership AS m
+                        WHERE m.organization_id=c.owner_id AND m.member_id=?1
+                          AND m.capability IN ('read','write','manage_members')
+                    ))
+                )",
+                params![actor_id, file_id, version_id],
+                |r| r.get(0),
+            )?;
+            if !authorized || !self_authorized_version(tx, version_id)? {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let current_epoch: u64 = tx.query_row(
+                "SELECT coordinator_epoch FROM catalog_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            if current_epoch != coordinator_epoch {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute(
+                "INSERT INTO reader_leases(file_id,version_id,actor_id,coordinator_epoch) VALUES (?1,?2,?3,?4)",
+                params![file_id, version_id, actor_id, coordinator_epoch],
+            )?;
+            Ok(tx.last_insert_rowid() as u64)
+        })
+    }
+    pub fn release_reader_lease(&mut self, lease_id: u64) -> rusqlite::Result<()> {
+        self.with_immediate_transaction(|tx| {
+            tx.execute("DELETE FROM reader_leases WHERE lease_id=?1", [lease_id])?;
+            Ok(())
+        })
+    }
+    pub fn reader_lease_active(
+        &self,
+        lease_id: u64,
+        actor_id: u64,
+        file_id: u64,
+        version_id: u64,
+        coordinator_epoch: u64,
+    ) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reader_leases WHERE lease_id=?1 AND actor_id=?2 AND file_id=?3 AND version_id=?4 AND coordinator_epoch=?5 AND coordinator_epoch=(SELECT coordinator_epoch FROM catalog_meta WHERE id=1))",
+            params![lease_id, actor_id, file_id, version_id, coordinator_epoch],
+            |r| r.get(0),
+        )
     }
     pub fn claim_coordinator_epoch(
         &mut self,
@@ -1065,6 +1237,16 @@ fn count_v1(c: &Connection, t: &str) -> rusqlite::Result<u64> {
     c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
 }
 
+fn self_authorized_version(tx: &Transaction<'_>, version_id: u64) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM publish_intents WHERE candidate_version_id=?1 AND state='published'
+        )",
+        [version_id],
+        |r| r.get(0),
+    )
+}
+
 fn load_intent(c: &Connection, operation_id: u64) -> rusqlite::Result<Option<IntentRecord>> {
     c.query_row(
         "SELECT actor_id,file_id,owner_epoch,owner_nonce,expected_head_version_id,
@@ -1224,8 +1406,8 @@ fn insert_v1(
     }
     cut_v1(cut, CrashPoint::AfterResults)
 }
-const SCHEMA_V1: &str = r#"
-CREATE TABLE IF NOT EXISTS catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=1),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL); INSERT OR IGNORE INTO catalog_meta VALUES(1,1,0,'{}');
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=2),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL); INSERT OR IGNORE INTO catalog_meta VALUES(1,2,0,'{}');
 CREATE TABLE IF NOT EXISTS principal(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,state TEXT NOT NULL,authz_epoch INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS membership(organization_id INTEGER NOT NULL REFERENCES principal(id),member_id INTEGER NOT NULL REFERENCES principal(id),capability TEXT NOT NULL,PRIMARY KEY(organization_id,member_id,capability));
 CREATE TABLE IF NOT EXISTS collections(id INTEGER PRIMARY KEY,owner_id INTEGER NOT NULL REFERENCES principal(id),name TEXT NOT NULL,UNIQUE(owner_id,name));
@@ -1234,4 +1416,5 @@ CREATE TABLE IF NOT EXISTS file_versions(id INTEGER PRIMARY KEY,file_id INTEGER 
 CREATE TABLE IF NOT EXISTS file_head(file_id INTEGER PRIMARY KEY REFERENCES files(id),version_id INTEGER,generation INTEGER NOT NULL,FOREIGN KEY(file_id,version_id) REFERENCES file_versions(file_id,id));
 CREATE TABLE IF NOT EXISTS publish_intents(operation_id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL REFERENCES principal(id),file_id INTEGER NOT NULL REFERENCES files(id),owner_epoch INTEGER NOT NULL,owner_nonce INTEGER NOT NULL,expected_head_version_id INTEGER,expected_head_generation INTEGER NOT NULL,candidate_version_id INTEGER,state TEXT NOT NULL CHECK(state IN ('preparing','commit_durable','published','aborted')),abort_reason TEXT,pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN(0,1)),request_fingerprint BLOB NOT NULL CHECK(typeof(request_fingerprint)='blob' AND length(request_fingerprint)=32),authz_epoch INTEGER NOT NULL,FOREIGN KEY(file_id,expected_head_version_id) REFERENCES file_versions(file_id,id),FOREIGN KEY(file_id,candidate_version_id) REFERENCES file_versions(file_id,id));
 CREATE TABLE IF NOT EXISTS operation_results(operation_id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL REFERENCES principal(id),kind TEXT NOT NULL,fingerprint BLOB NOT NULL CHECK(typeof(fingerprint)='blob' AND length(fingerprint)=32),state TEXT NOT NULL,result TEXT,error TEXT,UNIQUE(actor_id,kind,fingerprint));
+CREATE TABLE IF NOT EXISTS reader_leases(lease_id INTEGER PRIMARY KEY,file_id INTEGER NOT NULL REFERENCES files(id),version_id INTEGER NOT NULL,actor_id INTEGER NOT NULL REFERENCES principal(id),coordinator_epoch INTEGER NOT NULL,FOREIGN KEY(file_id,version_id) REFERENCES file_versions(file_id,id));
 "#;

@@ -1,0 +1,10 @@
+[package]
+name = "cairn-single-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "External coordinator seam for a single-node Cairn store"
+
+[dependencies]
+cairn-device = { path = "../device" }
+cairn-model = { path = "../model" }
