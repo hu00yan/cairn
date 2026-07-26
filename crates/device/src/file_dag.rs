@@ -58,6 +58,14 @@ pub enum FileDagStoreError {
     OperationConflict(u64),
 }
 
+/// A verified immutable snapshot descriptor safe for a coordinator boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedSnapshot {
+    pub commit_id: CommitId,
+    pub logical_size: u64,
+    pub content_digest: NodeId,
+}
+
 impl std::fmt::Display for FileDagStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "file DAG store error: {self:?}")
@@ -208,6 +216,27 @@ impl<D: BlockDevice> FileDagStore<D> {
             )?;
         }
         Ok(output)
+    }
+
+    pub fn verified_snapshot(
+        &mut self,
+        commit_id: CommitId,
+    ) -> Result<VerifiedSnapshot, FileDagStoreError> {
+        let commit = self.read_required_node(commit_id)?;
+        let Node::Commit(commit_node) = commit else {
+            return Err(FileDagStoreError::InvalidReference(commit_id));
+        };
+        let snapshot_id = commit_node.snapshot;
+        let snapshot = self.read_required_node(snapshot_id)?;
+        let Node::Snapshot(snapshot_node) = snapshot else {
+            return Err(FileDagStoreError::InvalidReference(snapshot_id));
+        };
+        self.validate_snapshot_digest(snapshot_id, &snapshot_node)?;
+        Ok(VerifiedSnapshot {
+            commit_id,
+            logical_size: snapshot_node.logical_size,
+            content_digest: snapshot_node.content_digest,
+        })
     }
 
     pub fn operation_binding(&self, operation_id: OperationId) -> Option<CommitId> {
@@ -939,6 +968,14 @@ mod tests {
         assert_eq!(
             reopened.read_snapshot_range(commit, 6..13).unwrap(),
             b"gh\0\0\0WX"
+        );
+        assert_eq!(
+            reopened.verified_snapshot(commit).unwrap(),
+            VerifiedSnapshot {
+                commit_id: commit,
+                logical_size: expected.len() as u64,
+                content_digest: content_digest(&expected),
+            }
         );
     }
 
