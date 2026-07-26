@@ -368,6 +368,20 @@ pub struct VersionRecord {
     pub size: u64,
     pub digest: [u8; 32],
 }
+
+/// A catalog-owned version descriptor. It intentionally carries no DAG node
+/// or operation record, so the coordinator can validate media through its
+/// separate adapter without exposing storage internals to callers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVersion {
+    pub id: u64,
+    pub file_id: u64,
+    pub generation: u64,
+    pub commit_id: [u8; 32],
+    pub parent_version_id: Option<u64>,
+    pub size: u64,
+    pub digest: [u8; 32],
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadRecord {
     pub file_id: u64,
@@ -595,6 +609,51 @@ impl SqliteCatalogStore {
     }
     pub fn coordinator_epoch_typed(&self) -> rusqlite::Result<CoordinatorEpoch> {
         Ok(CoordinatorEpoch::new(self.coordinator_epoch()?))
+    }
+    pub fn read_head(&self, file_id: u64) -> rusqlite::Result<Option<HeadRecord>> {
+        self.connection
+            .query_row(
+                "SELECT version_id,generation FROM file_head WHERE file_id=?1",
+                [file_id],
+                |r| {
+                    Ok(HeadRecord {
+                        file_id,
+                        version_id: r.get(0)?,
+                        generation: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+    }
+    pub fn read_version(
+        &self,
+        file_id: u64,
+        version_id: u64,
+    ) -> rusqlite::Result<Option<CatalogVersion>> {
+        self.connection
+            .query_row(
+                "SELECT id,generation,commit_id,parent_version_id,size,digest
+                   FROM file_versions WHERE file_id=?1 AND id=?2",
+                params![file_id, version_id],
+                |r| {
+                    let commit_id: Vec<u8> = r.get(2)?;
+                    let digest: Vec<u8> = r.get(5)?;
+                    Ok(CatalogVersion {
+                        id: r.get(0)?,
+                        file_id,
+                        generation: r.get(1)?,
+                        commit_id: commit_id
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        parent_version_id: r.get(3)?,
+                        size: r.get(4)?,
+                        digest: digest
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    })
+                },
+            )
+            .optional()
     }
     pub fn claim_coordinator_epoch(
         &mut self,
