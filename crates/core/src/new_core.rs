@@ -1,5 +1,5 @@
 #![deny(unsafe_code)]
-use cairn_device::{BlockDevice, DeviceError};
+use cairn_device::io::{BlockDevice, DeviceError};
 use std::collections::{HashMap, HashSet};
 
 pub type ObjectId = [u8; 32];

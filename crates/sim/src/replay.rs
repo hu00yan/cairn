@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use cairn_catalog::{ChunkRef as ModelChunkRef, Model};
 use cairn_core::{
     ChunkRef as CoreChunkRef, Error as CoreError, Root as CoreRoot, Store, RECORDS_START,
 };
 use cairn_device::{DeviceError, DeviceEvent, DeviceRule, DeviceScript, SimDisk};
-use cairn_model::{ChunkRef as ModelChunkRef, Model};
 use serde::{Deserialize, Serialize};
 
 mod oracle;
@@ -586,7 +586,7 @@ enum RejectionContext {
 fn compare_rejections(
     step: usize,
     core: &CoreError,
-    model: &cairn_model::Error,
+    model: &cairn_catalog::Error,
     context: RejectionContext,
 ) -> Result<StepOutcome, ReplayError> {
     let core_reason = core_rejection_reason(core, context).ok_or_else(|| {
@@ -638,21 +638,21 @@ fn core_rejection_reason(error: &CoreError, context: RejectionContext) -> Option
 }
 
 fn model_rejection_reason(
-    error: &cairn_model::Error,
+    error: &cairn_catalog::Error,
     context: RejectionContext,
 ) -> RejectionReason {
     match error {
-        cairn_model::Error::InvalidGeneration => RejectionReason::InvalidGeneration,
-        cairn_model::Error::InvalidManifest(_) | cairn_model::Error::NotFound(_)
+        cairn_catalog::Error::InvalidGeneration => RejectionReason::InvalidGeneration,
+        cairn_catalog::Error::InvalidManifest(_) | cairn_catalog::Error::NotFound(_)
             if matches!(context, RejectionContext::CommitRoot) =>
         {
             RejectionReason::InvalidManifest
         }
-        cairn_model::Error::InvalidManifest(_) => RejectionReason::InvalidInput,
-        cairn_model::Error::InvalidObjectId(_) | cairn_model::Error::ConflictingObject(_) => {
+        cairn_catalog::Error::InvalidManifest(_) => RejectionReason::InvalidInput,
+        cairn_catalog::Error::InvalidObjectId(_) | cairn_catalog::Error::ConflictingObject(_) => {
             RejectionReason::InvalidInput
         }
-        cairn_model::Error::NotFound(_) => RejectionReason::InvalidInput,
+        cairn_catalog::Error::NotFound(_) => RejectionReason::InvalidInput,
     }
 }
 
@@ -720,7 +720,7 @@ fn resolve_model_chunks(
 fn compare_roots(
     step: usize,
     core: &CoreRoot,
-    model: &cairn_model::Root,
+    model: &cairn_catalog::Root,
 ) -> Result<(), ReplayError> {
     if core.generation != model.generation || core.manifest != model.manifest {
         return Err(divergence(step, "root values differ"));

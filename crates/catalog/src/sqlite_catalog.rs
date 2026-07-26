@@ -1,7 +1,7 @@
 //! Minimal single-node SQLite catalog adapter.
 //!
 //! This module is intentionally independent of `catalog.rs`, `dag.rs`, and
-//! `native.rs`: it is an adapter seam, not a replacement for those models.
+//! `reference_store.rs`: it is an adapter seam, not a replacement for those models.
 //! The catalog transaction is durable; DAG media is an explicitly separate
 //! seam and is not claimed to be atomically committed with these rows.
 
@@ -358,6 +358,20 @@ pub struct FileRecord {
     pub collection_id: u64,
     pub name: String,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionInfo {
+    pub id: u64,
+    pub owner_id: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileInfo {
+    pub id: u64,
+    pub collection_id: u64,
+    pub name: String,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionRecord {
     pub id: u64,
@@ -539,8 +553,8 @@ pub struct SqliteCatalogStore {
     connection: Connection,
 }
 
-fn validate_schema_v2(connection: &Connection) -> rusqlite::Result<()> {
-    for statement in SCHEMA_V2.split(';') {
+fn validate_schema_v3(connection: &Connection) -> rusqlite::Result<()> {
+    for statement in SCHEMA_V3.split(';') {
         let statement = statement.trim();
         let Some(rest) = statement.strip_prefix("CREATE TABLE IF NOT EXISTS ") else {
             continue;
@@ -559,6 +573,27 @@ fn validate_schema_v2(connection: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+fn migrate_v2_to_v3(connection: &mut Connection) -> rusqlite::Result<()> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS catalog_allocators(name TEXT PRIMARY KEY,next_id INTEGER NOT NULL CHECK(next_id > 0));
+         INSERT OR IGNORE INTO catalog_allocators(name,next_id)
+             SELECT 'version',COALESCE(MAX(id),0)+1 FROM file_versions
+             ;
+         UPDATE catalog_allocators
+            SET next_id=MAX(next_id,(SELECT COALESCE(MAX(id),0)+1 FROM file_versions))
+          WHERE name='version';
+         CREATE UNIQUE INDEX IF NOT EXISTS file_versions_file_commit_unique
+             ON file_versions(file_id,commit_id);
+         ALTER TABLE catalog_meta RENAME TO catalog_meta_v2;
+         CREATE TABLE catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=3),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL);
+         INSERT INTO catalog_meta(id,schema_version,coordinator_epoch,allocators)
+             SELECT id,3,coordinator_epoch,allocators FROM catalog_meta_v2;
+         DROP TABLE catalog_meta_v2;",
+    )?;
+    tx.commit()
 }
 
 fn normalize_ddl(sql: &str) -> String {
@@ -606,18 +641,22 @@ impl SqliteCatalogStore {
         }
         if !has_catalog_meta {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch(SCHEMA_V3)?;
             tx.commit()?;
         }
-        let schema_version: u64 = connection.query_row(
+        let mut schema_version: u64 = connection.query_row(
             "SELECT schema_version FROM catalog_meta WHERE id = 1",
             [],
             |row| row.get(0),
         )?;
-        if schema_version != 2 {
+        if schema_version == 2 {
+            migrate_v2_to_v3(&mut connection)?;
+            schema_version = 3;
+        }
+        if schema_version != 3 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        validate_schema_v2(&connection)?;
+        validate_schema_v3(&connection)?;
         Ok(Self { connection })
     }
     fn with_immediate_transaction<T>(
@@ -631,6 +670,184 @@ impl SqliteCatalogStore {
         tx.commit()?;
         Ok(value)
     }
+
+    /// Installs the initial principal, collection, file, and empty head as one
+    /// durable metadata transaction. Repeating an identical bootstrap is safe.
+    pub fn bootstrap(
+        &mut self,
+        principal_id: u64,
+        collection_id: u64,
+        file_id: u64,
+        collection_name: &str,
+        file_name: &str,
+    ) -> rusqlite::Result<()> {
+        self.with_immediate_transaction(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO principal(id,kind,state,authz_epoch) VALUES (?1,'user','active',0)",
+                [principal_id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO collections(id,owner_id,name) VALUES (?1,?2,?3)",
+                params![collection_id, principal_id, collection_name],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO files(id,collection_id,name) VALUES (?1,?2,?3)",
+                params![file_id, collection_id, file_name],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO file_head(file_id,version_id,generation) VALUES (?1,NULL,0)",
+                [file_id],
+            )?;
+            let principal: (String, String, u64) = tx.query_row(
+                "SELECT kind,state,authz_epoch FROM principal WHERE id=?1",
+                [principal_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let collection: (u64, String) = tx.query_row(
+                "SELECT owner_id,name FROM collections WHERE id=?1",
+                [collection_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let file: (u64, String) = tx.query_row(
+                "SELECT collection_id,name FROM files WHERE id=?1",
+                [file_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let head: (Option<u64>, u64) = tx.query_row(
+                "SELECT version_id,generation FROM file_head WHERE file_id=?1",
+                [file_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if principal != ("user".into(), "active".into(), 0)
+                || collection != (principal_id, collection_name.to_owned())
+                || file != (collection_id, file_name.to_owned())
+                || head != (None, 0)
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            for (name, next_id) in [
+                ("principal", principal_id.saturating_add(1)),
+                ("collection", collection_id.saturating_add(1)),
+                ("file", file_id.saturating_add(1)),
+            ] {
+                tx.execute(
+                    "INSERT INTO catalog_allocators(name,next_id) VALUES (?1,?2)
+                     ON CONFLICT(name) DO UPDATE SET next_id=MAX(next_id,excluded.next_id)",
+                    params![name, next_id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_collection(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> rusqlite::Result<CollectionInfo> {
+        self.with_immediate_transaction(|tx| {
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM principal WHERE id=?1 AND state='active')",
+                [actor_id],
+                |r| r.get(0),
+            )?;
+            if !authorized {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT id,owner_id,name FROM collections WHERE owner_id=?1 AND name=?2",
+                    params![actor_id, name],
+                    |r| {
+                        Ok(CollectionInfo {
+                            id: r.get(0)?,
+                            owner_id: r.get(1)?,
+                            name: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?
+            {
+                return Ok(existing);
+            }
+            let id = allocate_id(tx, "collection")?;
+            tx.execute(
+                "INSERT INTO collections(id,owner_id,name) VALUES (?1,?2,?3)",
+                params![id, actor_id, name],
+            )?;
+            Ok(CollectionInfo {
+                id,
+                owner_id: actor_id,
+                name: name.to_owned(),
+            })
+        })
+    }
+
+    pub fn create_file(
+        &mut self,
+        actor_id: u64,
+        collection_id: u64,
+        name: &str,
+    ) -> rusqlite::Result<FileInfo> {
+        self.with_immediate_transaction(|tx| {
+            let owner: Option<u64> = tx
+                .query_row(
+                    "SELECT owner_id FROM collections WHERE id=?1",
+                    [collection_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let actor_active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM principal WHERE id=?1 AND state='active')",
+                [actor_id],
+                |r| r.get(0),
+            )?;
+            if owner != Some(actor_id) || !actor_active {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT id,collection_id,name FROM files WHERE collection_id=?1 AND name=?2",
+                    params![collection_id, name],
+                    |r| {
+                        Ok(FileInfo {
+                            id: r.get(0)?,
+                            collection_id: r.get(1)?,
+                            name: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?
+            {
+                return Ok(existing);
+            }
+            let id = allocate_id(tx, "file")?;
+            tx.execute(
+                "INSERT INTO files(id,collection_id,name) VALUES (?1,?2,?3)",
+                params![id, collection_id, name],
+            )?;
+            tx.execute(
+                "INSERT INTO file_head(file_id,version_id,generation) VALUES (?1,NULL,0)",
+                [id],
+            )?;
+            Ok(FileInfo {
+                id,
+                collection_id,
+                name: name.to_owned(),
+            })
+        })
+    }
+
+    pub fn terminal_operation_ids(&self) -> rusqlite::Result<Vec<u64>> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id FROM publish_intents
+             WHERE state IN ('published','aborted') ORDER BY operation_id",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<u64>, _>>();
+        ids
+    }
     pub fn coordinator_epoch(&self) -> rusqlite::Result<u64> {
         self.connection.query_row(
             "SELECT coordinator_epoch FROM catalog_meta WHERE id=1",
@@ -640,6 +857,15 @@ impl SqliteCatalogStore {
     }
     pub fn coordinator_epoch_typed(&self) -> rusqlite::Result<CoordinatorEpoch> {
         Ok(CoordinatorEpoch::new(self.coordinator_epoch()?))
+    }
+    pub fn principal_authz_epoch(&self, actor_id: u64) -> rusqlite::Result<Option<u64>> {
+        self.connection
+            .query_row(
+                "SELECT authz_epoch FROM principal WHERE id=?1 AND state='active'",
+                [actor_id],
+                |r| r.get(0),
+            )
+            .optional()
     }
     pub fn read_head(&self, file_id: u64) -> rusqlite::Result<Option<HeadRecord>> {
         self.connection
@@ -661,11 +887,36 @@ impl SqliteCatalogStore {
         file_id: u64,
         version_id: u64,
     ) -> rusqlite::Result<Option<CatalogVersion>> {
+        self.read_version_record(file_id, version_id, true)
+    }
+
+    /// Reads a candidate for the coordinator recovery path. Callers must not
+    /// expose this result to users until the publish intent is terminal.
+    pub fn read_candidate_version(
+        &self,
+        file_id: u64,
+        version_id: u64,
+    ) -> rusqlite::Result<Option<CatalogVersion>> {
+        self.read_version_record(file_id, version_id, false)
+    }
+
+    fn read_version_record(
+        &self,
+        file_id: u64,
+        version_id: u64,
+        published_only: bool,
+    ) -> rusqlite::Result<Option<CatalogVersion>> {
         self.connection
             .query_row(
                 "SELECT id,generation,commit_id,parent_version_id,size,digest
-                   FROM file_versions WHERE file_id=?1 AND id=?2",
-                params![file_id, version_id],
+                   FROM file_versions
+                  WHERE file_id=?1 AND id=?2
+                    AND (?3=0 OR EXISTS(
+                        SELECT 1 FROM publish_intents
+                         WHERE candidate_version_id=file_versions.id
+                           AND state='published'
+                    ))",
+                params![file_id, version_id, published_only],
                 |r| {
                     let commit_id: Vec<u8> = r.get(2)?;
                     let digest: Vec<u8> = r.get(5)?;
@@ -975,6 +1226,64 @@ impl SqliteCatalogStore {
             Ok(())
         })
     }
+    pub fn prepare_publish(
+        &mut self,
+        o: &OperationRecord,
+        i: &IntentRecord,
+    ) -> rusqlite::Result<bool> {
+        if o.operation_id != i.operation_id
+            || o.actor_id != i.actor_id
+            || o.request_fingerprint != i.request_fingerprint
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        self.with_immediate_transaction(|tx| {
+            let existing: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operation_results
+                    WHERE operation_id=?1
+                       OR (actor_id=?2 AND kind=?3 AND fingerprint=?4)
+                )",
+                params![o.operation_id, o.actor_id, o.kind, o.request_fingerprint.as_slice()],
+                |r| r.get(0),
+            )?;
+            if existing {
+                return Ok(false);
+            }
+            let authorized: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM catalog_meta AS cm
+                    JOIN principal AS p ON p.id=?2 AND p.state='active' AND p.authz_epoch=?3
+                    JOIN files AS f ON f.id=?4
+                    JOIN collections AS c ON c.id=f.collection_id
+                    WHERE cm.id=1 AND cm.coordinator_epoch=?1
+                      AND (c.owner_id=p.id OR EXISTS(
+                          SELECT 1 FROM membership AS m
+                          WHERE m.organization_id=c.owner_id AND m.member_id=p.id
+                            AND m.capability IN ('write','manage_members')
+                      ))
+                      AND ((?5 IS NULL AND ?6=0) OR EXISTS(
+                          SELECT 1 FROM file_head AS h
+                          WHERE h.file_id=?4 AND h.version_id IS ?5 AND h.generation=?6
+                      ))
+                )",
+                params![i.owner_epoch, i.actor_id, i.authz_epoch, i.file_id, i.expected_head_version_id, i.expected_head_generation],
+                |r| r.get(0),
+            )?;
+            if !authorized {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute(
+                "INSERT INTO operation_results(operation_id,actor_id,kind,fingerprint,state,result,error) VALUES (?1,?2,?3,?4,'in_progress',NULL,NULL)",
+                params![o.operation_id, o.actor_id, o.kind, o.request_fingerprint.as_slice()],
+            )?;
+            tx.execute(
+                "INSERT INTO publish_intents(operation_id,actor_id,file_id,owner_epoch,owner_nonce,expected_head_version_id,expected_head_generation,state,pinned,request_fingerprint,authz_epoch) VALUES (?1,?2,?3,?4,?5,?6,?7,'preparing',?8,?9,?10)",
+                params![i.operation_id,i.actor_id,i.file_id,i.owner_epoch,i.owner_nonce,i.expected_head_version_id,i.expected_head_generation,i.pinned,i.request_fingerprint.as_slice(),i.authz_epoch],
+            )?;
+            Ok(true)
+        })
+    }
     pub fn t2_record_candidate(
         &mut self,
         op: u64,
@@ -1020,6 +1329,92 @@ impl SqliteCatalogStore {
             )?;
             Ok(T2Outcome::Applied)
         })
+    }
+    pub fn t2_record_version(
+        &mut self,
+        op: u64,
+        epoch: CoordinatorEpoch,
+        nonce: u64,
+        version: &CatalogVersion,
+    ) -> rusqlite::Result<T2Outcome> {
+        self.with_immediate_transaction(|tx| {
+            let current: u64 = tx.query_row(
+                "SELECT coordinator_epoch FROM catalog_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let Some(intent) = load_intent(tx, op)? else {
+                return Ok(T2Outcome::MissingIntent);
+            };
+            if current != epoch.get()
+                || intent.owner_epoch != epoch.get()
+                || intent.owner_nonce != nonce
+            {
+                return Ok(T2Outcome::Fenced);
+            }
+            if intent.file_id != version.file_id {
+                return Ok(T2Outcome::NotPreparing);
+            }
+            let version_id = if intent.state == "commit_durable" {
+                let candidate = intent
+                    .candidate_version_id
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                if version.id != 0 && version.id != candidate {
+                    return Ok(T2Outcome::NotPreparing);
+                }
+                candidate
+            } else if intent.state == "preparing" && version.id == 0 {
+                let next_id: u64 = tx.query_row(
+                    "SELECT next_id FROM catalog_allocators WHERE name='version'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE catalog_allocators SET next_id=?1 WHERE name='version'",
+                    [next_id.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?],
+                )?;
+                next_id
+            } else if intent.state == "preparing" {
+                version.id
+            } else {
+                return Ok(T2Outcome::NotPreparing);
+            };
+            if intent.state == "commit_durable" {
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM file_versions WHERE id=?1 AND file_id=?2 AND generation=?3 AND commit_id=?4 AND parent_version_id IS ?5 AND size=?6 AND digest=?7)",
+                    params![version_id,version.file_id,version.generation,version.commit_id.as_slice(),version.parent_version_id,version.size,version.digest.as_slice()],
+                    |r| r.get(0),
+                )?;
+                return Ok(if matches { T2Outcome::Applied } else { T2Outcome::NotPreparing });
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO file_versions(id,file_id,generation,commit_id,parent_version_id,size,digest) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![version_id,version.file_id,version.generation,version.commit_id.as_slice(),version.parent_version_id,version.size,version.digest.as_slice()],
+            )?;
+            let matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_versions WHERE id=?1 AND file_id=?2 AND generation=?3 AND commit_id=?4 AND parent_version_id IS ?5 AND size=?6 AND digest=?7)",
+                params![version_id,version.file_id,version.generation,version.commit_id.as_slice(),version.parent_version_id,version.size,version.digest.as_slice()],
+                |r| r.get(0),
+            )?;
+            if !matches {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            advance_version_allocator(tx, version_id)?;
+            tx.execute(
+                "UPDATE publish_intents SET candidate_version_id=?1,state='commit_durable' WHERE operation_id=?2 AND owner_epoch=?3 AND owner_nonce=?4 AND state='preparing'",
+                params![version_id,op,epoch.get(),nonce],
+            )?;
+            Ok(T2Outcome::Applied)
+        })
+    }
+    pub fn candidate_version_id(&self, operation_id: u64) -> rusqlite::Result<Option<u64>> {
+        self.connection
+            .query_row(
+                "SELECT candidate_version_id FROM publish_intents WHERE operation_id=?1",
+                [operation_id],
+                |r| r.get(0),
+            )
+            .optional()
     }
     pub fn t3_publish(&mut self, op: u64, epoch: u64, nonce: u64) -> rusqlite::Result<bool> {
         Ok(matches!(
@@ -1237,6 +1632,22 @@ fn count_v1(c: &Connection, t: &str) -> rusqlite::Result<u64> {
     c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
 }
 
+fn advance_version_allocator(
+    tx: &rusqlite::Transaction<'_>,
+    version_id: u64,
+) -> rusqlite::Result<()> {
+    let next_id = version_id
+        .checked_add(1)
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    tx.execute(
+        "UPDATE catalog_allocators
+            SET next_id=CASE WHEN next_id < ?1 THEN ?1 ELSE next_id END
+          WHERE name='version'",
+        [next_id],
+    )?;
+    Ok(())
+}
+
 fn self_authorized_version(tx: &Transaction<'_>, version_id: u64) -> rusqlite::Result<bool> {
     tx.query_row(
         "SELECT EXISTS(
@@ -1353,6 +1764,7 @@ fn insert_v1(
                         v.digest.as_slice()
                     ],
                 )?;
+                advance_version_allocator(tx, v.id)?;
             } else {
                 deferred.push(v);
             }
@@ -1406,15 +1818,88 @@ fn insert_v1(
     }
     cut_v1(cut, CrashPoint::AfterResults)
 }
-const SCHEMA_V2: &str = r#"
-CREATE TABLE IF NOT EXISTS catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=2),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL); INSERT OR IGNORE INTO catalog_meta VALUES(1,2,0,'{}');
+
+fn allocate_id(tx: &rusqlite::Transaction<'_>, name: &str) -> rusqlite::Result<u64> {
+    let table = match name {
+        "principal" => "principal",
+        "collection" => "collections",
+        "file" => "files",
+        "version" => "file_versions",
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO catalog_allocators(name,next_id)
+             SELECT ?1,COALESCE(MAX(id),0)+1 FROM {table}"
+        ),
+        [name],
+    )?;
+    let id: u64 = tx.query_row(
+        "SELECT next_id FROM catalog_allocators WHERE name=?1",
+        [name],
+        |r| r.get(0),
+    )?;
+    let next = id.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
+    tx.execute(
+        "UPDATE catalog_allocators SET next_id=?1 WHERE name=?2",
+        params![next, name],
+    )?;
+    Ok(id)
+}
+
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=3),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL); INSERT OR IGNORE INTO catalog_meta VALUES(1,3,0,'{}');
+CREATE TABLE IF NOT EXISTS catalog_allocators(name TEXT PRIMARY KEY,next_id INTEGER NOT NULL CHECK(next_id > 0));
+INSERT OR IGNORE INTO catalog_allocators(name,next_id) VALUES('version',1);
 CREATE TABLE IF NOT EXISTS principal(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,state TEXT NOT NULL,authz_epoch INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS membership(organization_id INTEGER NOT NULL REFERENCES principal(id),member_id INTEGER NOT NULL REFERENCES principal(id),capability TEXT NOT NULL,PRIMARY KEY(organization_id,member_id,capability));
 CREATE TABLE IF NOT EXISTS collections(id INTEGER PRIMARY KEY,owner_id INTEGER NOT NULL REFERENCES principal(id),name TEXT NOT NULL,UNIQUE(owner_id,name));
 CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,collection_id INTEGER NOT NULL REFERENCES collections(id),name TEXT NOT NULL,UNIQUE(collection_id,name));
 CREATE TABLE IF NOT EXISTS file_versions(id INTEGER PRIMARY KEY,file_id INTEGER NOT NULL REFERENCES files(id),generation INTEGER NOT NULL,commit_id BLOB NOT NULL CHECK(typeof(commit_id)='blob' AND length(commit_id)=32),parent_version_id INTEGER,size INTEGER NOT NULL,digest BLOB NOT NULL CHECK(typeof(digest)='blob' AND length(digest)=32),UNIQUE(file_id,id),FOREIGN KEY(file_id,parent_version_id) REFERENCES file_versions(file_id,id));
+CREATE UNIQUE INDEX IF NOT EXISTS file_versions_file_commit_unique ON file_versions(file_id,commit_id);
 CREATE TABLE IF NOT EXISTS file_head(file_id INTEGER PRIMARY KEY REFERENCES files(id),version_id INTEGER,generation INTEGER NOT NULL,FOREIGN KEY(file_id,version_id) REFERENCES file_versions(file_id,id));
 CREATE TABLE IF NOT EXISTS publish_intents(operation_id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL REFERENCES principal(id),file_id INTEGER NOT NULL REFERENCES files(id),owner_epoch INTEGER NOT NULL,owner_nonce INTEGER NOT NULL,expected_head_version_id INTEGER,expected_head_generation INTEGER NOT NULL,candidate_version_id INTEGER,state TEXT NOT NULL CHECK(state IN ('preparing','commit_durable','published','aborted')),abort_reason TEXT,pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN(0,1)),request_fingerprint BLOB NOT NULL CHECK(typeof(request_fingerprint)='blob' AND length(request_fingerprint)=32),authz_epoch INTEGER NOT NULL,FOREIGN KEY(file_id,expected_head_version_id) REFERENCES file_versions(file_id,id),FOREIGN KEY(file_id,candidate_version_id) REFERENCES file_versions(file_id,id));
 CREATE TABLE IF NOT EXISTS operation_results(operation_id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL REFERENCES principal(id),kind TEXT NOT NULL,fingerprint BLOB NOT NULL CHECK(typeof(fingerprint)='blob' AND length(fingerprint)=32),state TEXT NOT NULL,result TEXT,error TEXT,UNIQUE(actor_id,kind,fingerprint));
 CREATE TABLE IF NOT EXISTS reader_leases(lease_id INTEGER PRIMARY KEY,file_id INTEGER NOT NULL REFERENCES files(id),version_id INTEGER NOT NULL,actor_id INTEGER NOT NULL REFERENCES principal(id),coordinator_epoch INTEGER NOT NULL,FOREIGN KEY(file_id,version_id) REFERENCES file_versions(file_id,id));
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_migration_rebuilds_meta_and_seeds_the_version_allocator() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE catalog_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL CHECK(schema_version=2),coordinator_epoch INTEGER NOT NULL,allocators TEXT NOT NULL);
+                 INSERT INTO catalog_meta VALUES(1,2,9,'{}');
+                 CREATE TABLE file_versions(id INTEGER PRIMARY KEY,file_id INTEGER NOT NULL,generation INTEGER NOT NULL,commit_id BLOB NOT NULL,parent_version_id INTEGER,size INTEGER NOT NULL,digest BLOB NOT NULL);
+                 CREATE TABLE catalog_allocators(name TEXT PRIMARY KEY,next_id INTEGER NOT NULL);
+                 INSERT INTO catalog_allocators VALUES('version',1);
+                 INSERT INTO file_versions VALUES(41,7,1,zeroblob(32),NULL,0,zeroblob(32));",
+            )
+            .unwrap();
+        migrate_v2_to_v3(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT schema_version FROM catalog_meta WHERE id=1",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT next_id FROM catalog_allocators WHERE name='version'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            42
+        );
+    }
+}

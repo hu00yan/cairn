@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_device::{FileDagStore, FileDevice};
-use cairn_model::{Node, ZeroRunNode};
+use cairn_catalog::{Node, ZeroRunNode};
+use cairn_device::{dag_store::FileDagStore, io::FileDevice};
 
 fn test_path() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);

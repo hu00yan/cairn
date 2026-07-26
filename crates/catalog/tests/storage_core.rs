@@ -1,6 +1,6 @@
+use cairn_catalog::{ChunkRef, Error as ModelError, Model, ObjectId, Root as ModelRoot};
 use cairn_core::{ChunkRef as CoreChunkRef, Error as CoreError, Root as CoreRoot, Store};
-use cairn_device::SimDisk;
-use cairn_model::{ChunkRef, Error as ModelError, Model, ObjectId, Root as ModelRoot};
+use cairn_device::io::SimDisk;
 
 const DISK_SIZE: usize = 64 * 1024;
 

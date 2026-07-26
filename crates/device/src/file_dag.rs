@@ -4,18 +4,20 @@ use std::{
 };
 
 use blake3::Hasher;
-use cairn_model::dag::MAX_SNAPSHOT_EXTENTS;
-use cairn_model::{
-    decode_node, encode_node_payload, CommitId, DagError, Node, NodeId, NodeKind, OperationId,
+use cairn_catalog::dag::{content_digest, MAX_CONTENT_NODE_PAYLOAD, MAX_SNAPSHOT_EXTENTS};
+use cairn_catalog::{
+    decode_node, encode_node_payload, CommitId, CommitNode, ContentNode, DagError, Node, NodeId,
+    NodeKind, OperationId, RangeMapEntry, RangeMapNode, SnapshotNode,
 };
 
-use crate::{BlockDevice, DeviceError};
+use crate::io::{BlockDevice, DeviceError};
 
 /// The fixed on-device header: kind (u16), payload length (u32), checksum (32).
 pub const RECORD_HEADER_LEN: usize = 2 + 4 + 32;
 const RECORD_FOOTER_MAGIC: [u8; 8] = *b"CAIRNEND";
 const RECORD_FOOTER_LEN: usize = 8 + 8 + 32;
 const BINDING_KIND: u16 = 0x100;
+const TOMBSTONE_KIND: u16 = 0x101;
 const MAX_RECORD_PAYLOAD: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_READ_BYTES: usize = 64 * 1024 * 1024;
 
@@ -23,6 +25,7 @@ const MAX_SNAPSHOT_READ_BYTES: usize = 64 * 1024 * 1024;
 pub enum RecordKind {
     Node(NodeKind),
     OperationBinding,
+    OperationTombstone,
 }
 
 impl RecordKind {
@@ -30,12 +33,16 @@ impl RecordKind {
         match self {
             Self::Node(kind) => kind as u16,
             Self::OperationBinding => BINDING_KIND,
+            Self::OperationTombstone => TOMBSTONE_KIND,
         }
     }
 
     fn decode(code: u16) -> Result<Self, FileDagStoreError> {
         if code == BINDING_KIND {
             return Ok(Self::OperationBinding);
+        }
+        if code == TOMBSTONE_KIND {
+            return Ok(Self::OperationTombstone);
         }
         NodeKind::try_from(code)
             .map(Self::Node)
@@ -56,6 +63,11 @@ pub enum FileDagStoreError {
     RecordTooLarge(usize),
     CapacityExhausted { needed: u64, remaining: u64 },
     OperationConflict(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OperationBinding {
+    commit_id: CommitId,
 }
 
 /// A verified immutable snapshot descriptor safe for a coordinator boundary.
@@ -94,7 +106,8 @@ pub struct FileDagStore<D> {
     device: D,
     next_offset: u64,
     nodes: HashMap<NodeId, u64>,
-    bindings: HashMap<u64, (CommitId, u64)>,
+    bindings: HashMap<u64, OperationBinding>,
+    tombstones: HashMap<u64, CommitId>,
     validated_snapshots: HashSet<NodeId>,
 }
 
@@ -105,6 +118,7 @@ impl<D: BlockDevice> FileDagStore<D> {
             device,
             nodes: HashMap::new(),
             bindings: HashMap::new(),
+            tombstones: HashMap::new(),
             validated_snapshots: HashSet::new(),
         };
         store.scan()?;
@@ -127,14 +141,53 @@ impl<D: BlockDevice> FileDagStore<D> {
         Ok(id)
     }
 
+    /// Appends a complete immutable snapshot and its commit in dependency order.
+    /// This is intentionally a narrow builder for the single-node coordinator;
+    /// patching can later preserve unaffected leaves instead of materializing bytes.
+    pub fn append_snapshot(
+        &mut self,
+        bytes: &[u8],
+        parent: Option<CommitId>,
+    ) -> Result<VerifiedSnapshot, FileDagStoreError> {
+        let mut children = Vec::new();
+        for (index, chunk) in bytes.chunks(MAX_CONTENT_NODE_PAYLOAD).enumerate() {
+            let child = self.append_node(&Node::Content(ContentNode {
+                bytes: chunk.to_vec(),
+            }))?;
+            children.push(RangeMapEntry {
+                logical_start: (index * MAX_CONTENT_NODE_PAYLOAD) as u64,
+                logical_len: chunk.len() as u64,
+                content_offset: 0,
+                child_kind: NodeKind::Content,
+                child,
+            });
+        }
+        let range_map = self.append_node(&Node::RangeMap(RangeMapNode { level: 0, children }))?;
+        let digest = content_digest(bytes);
+        let snapshot = self.append_node(&Node::Snapshot(SnapshotNode {
+            logical_size: bytes.len() as u64,
+            range_map_root: range_map,
+            content_digest: digest,
+        }))?;
+        let commit = self.append_node(&Node::Commit(CommitNode { snapshot, parent }))?;
+        Ok(VerifiedSnapshot {
+            commit_id: commit,
+            logical_size: bytes.len() as u64,
+            content_digest: digest,
+        })
+    }
+
     pub fn bind_operation(
         &mut self,
         operation_id: OperationId,
         commit_id: CommitId,
     ) -> Result<(), FileDagStoreError> {
         self.validate_commit(commit_id)?;
-        if let Some(&(existing, _)) = self.bindings.get(&operation_id.get()) {
-            if existing != commit_id {
+        if self.tombstones.contains_key(&operation_id.get()) {
+            return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+        }
+        if let Some(existing) = self.bindings.get(&operation_id.get()) {
+            if existing.commit_id != commit_id {
                 return Err(FileDagStoreError::OperationConflict(operation_id.get()));
             }
             return Ok(());
@@ -142,10 +195,38 @@ impl<D: BlockDevice> FileDagStore<D> {
         let mut payload = Vec::with_capacity(40);
         payload.extend_from_slice(&operation_id.get().to_le_bytes());
         payload.extend_from_slice(&commit_id);
-        let offset = self.next_offset;
         self.append_record(RecordKind::OperationBinding, &payload)?;
         self.bindings
-            .insert(operation_id.get(), (commit_id, offset));
+            .insert(operation_id.get(), OperationBinding { commit_id });
+        Ok(())
+    }
+
+    /// Appends a durable terminal marker for an active operation binding.
+    /// The marker is sticky: it remains queryable after reopen, but the
+    /// operation no longer contributes an active commit root.
+    pub fn tombstone_operation(
+        &mut self,
+        operation_id: OperationId,
+        commit_id: CommitId,
+    ) -> Result<(), FileDagStoreError> {
+        self.validate_commit(commit_id)?;
+        if let Some(&existing) = self.tombstones.get(&operation_id.get()) {
+            return (existing == commit_id)
+                .then_some(())
+                .ok_or(FileDagStoreError::OperationConflict(operation_id.get()));
+        }
+        let Some(existing) = self.bindings.get(&operation_id.get()) else {
+            return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+        };
+        if existing.commit_id != commit_id {
+            return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+        }
+        let mut payload = Vec::with_capacity(40);
+        payload.extend_from_slice(&operation_id.get().to_le_bytes());
+        payload.extend_from_slice(&commit_id);
+        self.append_record(RecordKind::OperationTombstone, &payload)?;
+        self.bindings.remove(&operation_id.get());
+        self.tombstones.insert(operation_id.get(), commit_id);
         Ok(())
     }
 
@@ -242,7 +323,11 @@ impl<D: BlockDevice> FileDagStore<D> {
     pub fn operation_binding(&self, operation_id: OperationId) -> Option<CommitId> {
         self.bindings
             .get(&operation_id.get())
-            .map(|(commit, _)| *commit)
+            .map(|binding| binding.commit_id)
+    }
+
+    pub fn operation_tombstone(&self, operation_id: OperationId) -> Option<CommitId> {
+        self.tombstones.get(&operation_id.get()).copied()
     }
 
     pub fn next_offset(&self) -> u64 {
@@ -356,13 +441,43 @@ impl<D: BlockDevice> FileDagStore<D> {
                 let mut commit_id = [0; 32];
                 commit_id.copy_from_slice(&payload[8..]);
                 self.validate_commit(commit_id)?;
-                if let Some((existing, _)) = self.bindings.get(&operation_id) {
-                    if *existing != commit_id {
+                if self.tombstones.contains_key(&operation_id) {
+                    return Err(FileDagStoreError::OperationConflict(operation_id));
+                }
+                if let Some(existing) = self.bindings.get(&operation_id) {
+                    if existing.commit_id != commit_id {
                         return Err(FileDagStoreError::OperationConflict(operation_id));
                     }
                 } else {
-                    self.bindings.insert(operation_id, (commit_id, offset));
+                    self.bindings
+                        .insert(operation_id, OperationBinding { commit_id });
                 }
+            }
+            RecordKind::OperationTombstone => {
+                if payload.len() != 40 {
+                    return Err(FileDagStoreError::CorruptRecord {
+                        offset,
+                        reason: "tombstone payload length",
+                    });
+                }
+                let operation_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                let mut commit_id = [0; 32];
+                commit_id.copy_from_slice(&payload[8..]);
+                self.validate_commit(commit_id)?;
+                if let Some(existing) = self.tombstones.get(&operation_id) {
+                    if *existing != commit_id {
+                        return Err(FileDagStoreError::OperationConflict(operation_id));
+                    }
+                    return Ok(());
+                }
+                let Some(existing) = self.bindings.get(&operation_id) else {
+                    return Err(FileDagStoreError::OperationConflict(operation_id));
+                };
+                if existing.commit_id != commit_id {
+                    return Err(FileDagStoreError::OperationConflict(operation_id));
+                }
+                self.bindings.remove(&operation_id);
+                self.tombstones.insert(operation_id, commit_id);
             }
         }
         Ok(())
@@ -444,7 +559,7 @@ impl<D: BlockDevice> FileDagStore<D> {
 
     fn read_map_range(
         &mut self,
-        map: cairn_model::RangeMapNode,
+        map: cairn_catalog::RangeMapNode,
         logical_size: u64,
         expected: Range<u64>,
         requested: Range<u64>,
@@ -487,7 +602,7 @@ impl<D: BlockDevice> FileDagStore<D> {
                 .ok_or(FileDagStoreError::InvalidSnapshot("output coverage"))?;
             let child_offset = start - entry.logical_start;
             match entry.child_kind {
-                cairn_model::NodeKind::RangeMap => {
+                cairn_catalog::NodeKind::RangeMap => {
                     if map.level == 0 {
                         return Err(FileDagStoreError::InvalidReference(entry.child));
                     }
@@ -507,7 +622,7 @@ impl<D: BlockDevice> FileDagStore<D> {
                         budget,
                     )?;
                 }
-                cairn_model::NodeKind::ZeroRun => {
+                cairn_catalog::NodeKind::ZeroRun => {
                     budget.leaves = budget
                         .leaves
                         .checked_add(1)
@@ -529,7 +644,7 @@ impl<D: BlockDevice> FileDagStore<D> {
                     }
                     target.fill(0);
                 }
-                cairn_model::NodeKind::Content => {
+                cairn_catalog::NodeKind::Content => {
                     budget.leaves = budget
                         .leaves
                         .checked_add(1)
@@ -590,7 +705,7 @@ impl<D: BlockDevice> FileDagStore<D> {
     fn validate_snapshot_digest(
         &mut self,
         snapshot_id: NodeId,
-        snapshot: &cairn_model::SnapshotNode,
+        snapshot: &cairn_catalog::SnapshotNode,
     ) -> Result<(), FileDagStoreError> {
         if self.validated_snapshots.contains(&snapshot_id) {
             return Ok(());
@@ -636,7 +751,7 @@ struct ReadBudget {
     leaves: usize,
 }
 
-fn map_span_for_read(map: &cairn_model::RangeMapNode) -> Result<(u64, u64), FileDagStoreError> {
+fn map_span_for_read(map: &cairn_catalog::RangeMapNode) -> Result<(u64, u64), FileDagStoreError> {
     let Some(first) = map.children.first() else {
         return Ok((0, 0));
     };
@@ -649,7 +764,7 @@ fn map_span_for_read(map: &cairn_model::RangeMapNode) -> Result<(u64, u64), File
 }
 
 fn validate_map_root(
-    map: &cairn_model::RangeMapNode,
+    map: &cairn_catalog::RangeMapNode,
     logical_size: u64,
 ) -> Result<(), FileDagStoreError> {
     if logical_size == 0 {
@@ -722,7 +837,7 @@ mod tests {
         DeviceEffect, DeviceEventKind, DeviceRule, DeviceScript, EventOccurrence, EventSelector,
         SimDisk,
     };
-    use cairn_model::{
+    use cairn_catalog::{
         content_digest, CommitNode, ContentNode, ModelCatalog, NodeKind, RangeMapEntry,
         RangeMapNode, SnapshotNode, ZeroRunNode,
     };
@@ -762,6 +877,64 @@ mod tests {
         let mut reopened = FileDagStore::open(disk).unwrap();
         assert_eq!(reopened.node(&node_id).unwrap(), Some(node));
         assert_eq!(reopened.operation_binding(operation), Some(commit));
+    }
+
+    #[test]
+    fn operation_tombstone_is_sticky_and_survives_scan_reopen() {
+        let disk = SimDisk::new(4096);
+        let mut store = FileDagStore::open(disk).unwrap();
+        let map = store
+            .append_node(&Node::RangeMap(RangeMapNode {
+                level: 0,
+                children: Vec::new(),
+            }))
+            .unwrap();
+        let snapshot = store
+            .append_node(&Node::Snapshot(SnapshotNode {
+                logical_size: 0,
+                range_map_root: map,
+                content_digest: content_digest(&[]),
+            }))
+            .unwrap();
+        let commit = store
+            .append_node(&Node::Commit(CommitNode {
+                snapshot,
+                parent: None,
+            }))
+            .unwrap();
+        let operation = operation_id();
+        store.bind_operation(operation, commit).unwrap();
+        assert_eq!(store.operation_binding(operation), Some(commit));
+        let after_bind = store.next_offset();
+        store.bind_operation(operation, commit).unwrap();
+        assert_eq!(store.next_offset(), after_bind);
+
+        let other_commit = store
+            .append_node(&Node::Commit(CommitNode {
+                snapshot,
+                parent: Some(commit),
+            }))
+            .unwrap();
+        assert!(matches!(
+            store.tombstone_operation(operation, other_commit),
+            Err(FileDagStoreError::OperationConflict(id)) if id == operation.get()
+        ));
+
+        store.tombstone_operation(operation, commit).unwrap();
+        let after_tombstone = store.next_offset();
+        assert_eq!(store.operation_binding(operation), None);
+        assert_eq!(store.operation_tombstone(operation), Some(commit));
+        store.tombstone_operation(operation, commit).unwrap();
+        assert_eq!(store.next_offset(), after_tombstone);
+        assert!(matches!(
+            store.bind_operation(operation, commit),
+            Err(FileDagStoreError::OperationConflict(id)) if id == operation.get()
+        ));
+
+        let disk = store.into_inner();
+        let reopened = FileDagStore::open(disk).unwrap();
+        assert_eq!(reopened.operation_binding(operation), None);
+        assert_eq!(reopened.operation_tombstone(operation), Some(commit));
     }
 
     #[test]
@@ -949,6 +1122,26 @@ mod tests {
             }))
             .unwrap();
         (store.into_inner(), commit_id, expected)
+    }
+
+    #[test]
+    fn append_snapshot_builds_a_reopenable_commit() {
+        let disk = SimDisk::new(32 * 1024);
+        let mut store = FileDagStore::open(disk).unwrap();
+        let bytes = b"durable write".to_vec();
+        let verified = store.append_snapshot(&bytes, None).unwrap();
+        assert_eq!(
+            store
+                .read_snapshot_range(verified.commit_id, 0..bytes.len() as u64)
+                .unwrap(),
+            bytes
+        );
+        let disk = store.into_inner();
+        let mut reopened = FileDagStore::open(disk).unwrap();
+        assert_eq!(
+            reopened.verified_snapshot(verified.commit_id).unwrap(),
+            verified
+        );
     }
 
     #[test]

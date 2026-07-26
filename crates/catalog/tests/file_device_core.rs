@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_core::{ChunkRef, Error as CoreError, Store};
-use cairn_device::{BlockDevice, FileDevice};
+use cairn_device::io::{BlockDevice, FileDevice};
 
 const DISK_SIZE: u64 = 256 * 1024;
 

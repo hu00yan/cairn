@@ -1,3 +1,5 @@
+//! In-memory reference implementation of the catalog and write contract.
+
 use crate::catalog::{
     CatalogError, CollectionId, FileId, FileVersion, Head, ModelCatalog, OperationId,
     OperationKind, OperationRecord, OperationResult, PrincipalId, VersionId,

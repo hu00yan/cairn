@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 cairn-core = { path = "../core" }
 cairn-device = { path = "../device" }
-cairn-model = { path = "../model" }
+cairn-catalog = { path = "../catalog" }
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true

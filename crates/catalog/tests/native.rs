@@ -1,9 +1,9 @@
-use cairn_model::{
+use cairn_catalog::{
     CatalogError, NativeError, OperationTerminal, OperationViewResult, SnapshotHandle, Store,
     MAX_RANGE_WRITE_BYTES,
 };
 
-fn store() -> (Store, cairn_model::CollectionId) {
+fn store() -> (Store, cairn_catalog::CollectionId) {
     let mut store = Store::open_default().unwrap();
     let collection_op = store.allocate_operation_id().unwrap();
     let collection = store.create_collection("docs", collection_op).unwrap();
@@ -11,7 +11,7 @@ fn store() -> (Store, cairn_model::CollectionId) {
 }
 
 #[test]
-fn native_write_read_and_zero_fill_are_bounded() {
+fn reference_store_write_read_and_zero_fill_are_bounded() {
     let (mut store, collection) = store();
     let unused_op = store.allocate_operation_id().unwrap();
     assert!(store.query_operation(unused_op).unwrap().is_none());
@@ -48,7 +48,7 @@ fn native_write_read_and_zero_fill_are_bounded() {
 }
 
 #[test]
-fn native_cas_shrink_and_abort() {
+fn reference_store_cas_shrink_and_abort() {
     let (mut store, collection) = store();
     let file_op = store.allocate_operation_id().unwrap();
     let file = store.create_file(collection, "cas", file_op).unwrap();
@@ -62,7 +62,7 @@ fn native_cas_shrink_and_abort() {
     assert!(matches!(
         store.begin_write(file, initial, stale_op),
         Err(NativeError::Catalog(
-            cairn_model::CatalogError::HeadConflict
+            cairn_catalog::CatalogError::HeadConflict
         ))
     ));
 

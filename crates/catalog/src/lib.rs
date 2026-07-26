@@ -1,9 +1,15 @@
+//! Catalog and protocol domain for Cairn.
+//!
+//! The crate owns metadata identities, publish/recovery invariants, the
+//! in-memory reference store, and the SQLite catalog adapter. It does not own
+//! block-device I/O; that responsibility is exposed by `cairn-device`.
+
 pub mod catalog;
 pub mod dag;
-pub mod native;
-pub mod sqlite_store;
+pub mod reference_store;
+pub mod sqlite_catalog;
 
-pub use native::{
+pub use reference_store::{
     NativeError, OperationTerminal, OperationView, OperationViewResult, SnapshotHandle, Store,
     StoreConfig, Version, WriteTxn, MAX_RANGE_WRITE_BYTES,
 };

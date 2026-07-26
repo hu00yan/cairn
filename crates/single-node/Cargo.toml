@@ -6,5 +6,7 @@ license.workspace = true
 description = "External coordinator seam for a single-node Cairn store"
 
 [dependencies]
+blake3.workspace = true
 cairn-device = { path = "../device" }
-cairn-model = { path = "../model" }
+cairn-catalog = { path = "../catalog" }
+libc.workspace = true

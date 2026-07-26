@@ -1,19 +1,26 @@
+//! Device adapters and the durable DAG record store.
+//!
+//! `io` contains block-device implementations and fault-test adapters;
+//! `dag_store` contains the record log, scanner, and snapshot validation.
+
 mod device_script;
-
-pub use device_script::*;
-
 mod media_model;
-
-pub use media_model::*;
 
 #[cfg(any(unix, windows))]
 mod file_device;
 
-#[cfg(any(unix, windows))]
-pub use file_device::FileDevice;
+#[path = "file_dag.rs"]
+pub mod dag_store;
 
-mod file_dag;
+pub mod io {
+    pub use super::device_script::*;
+    pub use super::media_model::*;
 
-pub use file_dag::{
+    #[cfg(any(unix, windows))]
+    pub use super::file_device::FileDevice;
+}
+
+pub use dag_store::{
     FileDagStore, FileDagStoreError, RecordKind, VerifiedSnapshot, RECORD_HEADER_LEN,
 };
+pub use io::*;

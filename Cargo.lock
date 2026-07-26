@@ -47,6 +47,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-catalog"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cairn-core",
+ "cairn-device",
+ "rusqlite",
+ "serde",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "cairn-core"
 version = "0.1.0"
 dependencies = [
@@ -59,7 +71,7 @@ name = "cairn-device"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "cairn-model",
+ "cairn-catalog",
  "serde",
  "serde_json",
 ]
@@ -72,25 +84,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cairn-model"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "cairn-core",
- "cairn-device",
- "rusqlite",
- "serde",
- "unicode-normalization",
-]
-
-[[package]]
 name = "cairn-sim"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cairn-catalog",
  "cairn-core",
  "cairn-device",
- "cairn-model",
  "serde",
  "serde_json",
 ]
@@ -99,8 +99,10 @@ dependencies = [
 name = "cairn-single-node"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "cairn-catalog",
  "cairn-device",
- "cairn-model",
+ "libc",
 ]
 
 [[package]]

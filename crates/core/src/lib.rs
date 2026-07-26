@@ -1,5 +1,10 @@
+//! Legacy chunk/manifest record engine retained for compatibility tests.
+//!
+//! New single-node protocol work belongs to `cairn-catalog`, `cairn-device`,
+//! and `cairn-single-node`; this crate is not the new storage kernel.
+
 #![deny(unsafe_code)]
-use cairn_device::{BlockDevice, DeviceError};
+use cairn_device::io::{BlockDevice, DeviceError};
 use std::collections::HashMap;
 
 pub type ObjectId = [u8; 32];
@@ -295,7 +300,7 @@ impl<D: BlockDevice> Store<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_device::SimDisk;
+    use cairn_device::io::SimDisk;
 
     #[test]
     fn put_get_commit_and_reopen() {

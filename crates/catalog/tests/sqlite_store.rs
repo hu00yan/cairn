@@ -1,4 +1,4 @@
-use cairn_model::sqlite_store::{
+use cairn_catalog::sqlite_catalog::{
     CatalogBatch, CatalogCounts, CollectionRecord, CrashPoint, FileRecord, SqliteCatalogStore,
 };
 
@@ -68,7 +68,7 @@ mod legacy_tests {
         let reopened = SqliteCatalogStore::open(&path).unwrap();
         assert_eq!(
             reopened.counts().unwrap(),
-            sqlite_store::CatalogCounts {
+            sqlite_catalog::CatalogCounts {
                 collections: 1,
                 files: 1,
                 versions: 1,
@@ -106,16 +106,16 @@ mod legacy_tests {
             let reopened = SqliteCatalogStore::open(&path).unwrap();
             assert_eq!(
                 reopened.counts().unwrap(),
-                sqlite_store::CatalogCounts::default()
+                sqlite_catalog::CatalogCounts::default()
             );
             let _ = std::fs::remove_file(path);
         }
     }
 }
 
-use cairn_model::sqlite_store::{
-    ClaimIntentOutcome, CoordinatorEpoch, HeadRecord, IntentRecord, OperationRecord,
-    PrincipalRecord, RecoveryWork, T2Outcome, T3Outcome, VersionRecord,
+use cairn_catalog::sqlite_catalog::{
+    CatalogVersion, ClaimIntentOutcome, CoordinatorEpoch, HeadRecord, IntentRecord,
+    OperationRecord, PrincipalRecord, RecoveryWork, T2Outcome, T3Outcome, VersionRecord,
 };
 use rusqlite::Connection;
 
@@ -161,7 +161,7 @@ fn sol_v1_schema_reopens_and_preserves_catalog() {
     let s = SqliteCatalogStore::open(&path).unwrap();
     assert_eq!(s.counts().unwrap().collections, 1);
     assert_eq!(s.coordinator_epoch().unwrap(), 0);
-    assert!(cairn_model::sqlite_store::DAG_DURABILITY_SEAM.contains("not atomic"));
+    assert!(cairn_catalog::sqlite_catalog::DAG_DURABILITY_SEAM.contains("not atomic"));
     let _ = std::fs::remove_file(path);
 }
 
@@ -227,6 +227,115 @@ fn non_empty_head_batch_inserts_versions_before_heads() {
     s.persist(&b).unwrap();
     assert_eq!(s.counts().unwrap().versions, 1);
     assert_eq!(s.counts().unwrap().heads, 1);
+}
+
+#[test]
+fn version_allocator_is_global_and_retries_use_the_durable_candidate() {
+    let mut s = SqliteCatalogStore::in_memory().unwrap();
+    let mut b = v1_batch();
+    b.collections.push(CollectionRecord {
+        id: 11,
+        owner_id: 1,
+        name: "other".into(),
+    });
+    b.files.push(FileRecord {
+        id: 21,
+        collection_id: 11,
+        name: "other".into(),
+    });
+    b.heads.push(HeadRecord {
+        file_id: 21,
+        version_id: None,
+        generation: 0,
+    });
+    b.versions.push(VersionRecord {
+        id: 30,
+        file_id: 20,
+        generation: 1,
+        commit_id: [1; 32],
+        parent_version_id: None,
+        size: 1,
+        digest: [2; 32],
+    });
+    b.operations.extend([
+        OperationRecord {
+            operation_id: 40,
+            actor_id: 1,
+            kind: "publish".into(),
+            request_fingerprint: [4; 32],
+            state: "prepared".into(),
+            result: None,
+            error: None,
+        },
+        OperationRecord {
+            operation_id: 41,
+            actor_id: 1,
+            kind: "publish".into(),
+            request_fingerprint: [5; 32],
+            state: "prepared".into(),
+            result: None,
+            error: None,
+        },
+    ]);
+    s.persist(&b).unwrap();
+    for (op, file, nonce, fingerprint) in [(40, 20, 7, [4; 32]), (41, 21, 8, [5; 32])] {
+        s.t1_prepare(&IntentRecord {
+            operation_id: op,
+            actor_id: 1,
+            file_id: file,
+            owner_epoch: 0,
+            owner_nonce: nonce,
+            expected_head_version_id: None,
+            expected_head_generation: 0,
+            candidate_version_id: None,
+            state: "preparing".into(),
+            abort_reason: None,
+            pinned: true,
+            request_fingerprint: fingerprint,
+            authz_epoch: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            s.t2_record_version(
+                op,
+                CoordinatorEpoch::ZERO,
+                nonce,
+                &CatalogVersion {
+                    id: 0,
+                    file_id: file,
+                    generation: 1,
+                    commit_id: [9; 32],
+                    parent_version_id: None,
+                    size: 2,
+                    digest: [8; 32],
+                },
+            )
+            .unwrap(),
+            T2Outcome::Applied
+        );
+    }
+    assert_eq!(s.candidate_version_id(40).unwrap(), Some(31));
+    assert_eq!(s.candidate_version_id(41).unwrap(), Some(32));
+    assert!(s.read_version(20, 31).unwrap().is_none());
+    assert!(s.read_candidate_version(20, 31).unwrap().is_some());
+    assert_eq!(
+        s.t2_record_version(
+            40,
+            CoordinatorEpoch::ZERO,
+            7,
+            &CatalogVersion {
+                id: 31,
+                file_id: 20,
+                generation: 1,
+                commit_id: [9; 32],
+                parent_version_id: None,
+                size: 2,
+                digest: [8; 32],
+            },
+        )
+        .unwrap(),
+        T2Outcome::Applied
+    );
 }
 
 #[test]
@@ -438,7 +547,7 @@ fn typed_recovery_claims_nonterminal_and_preserves_tombstones_after_reopen() {
         assert_eq!(
             s.claim_coordinator_epoch(CoordinatorEpoch::ZERO, CoordinatorEpoch::new(1))
                 .unwrap(),
-            cairn_model::sqlite_store::EpochClaim::Claimed(CoordinatorEpoch::new(1))
+            cairn_catalog::sqlite_catalog::EpochClaim::Claimed(CoordinatorEpoch::new(1))
         );
         assert!(matches!(
             s.claim_intent(70, CoordinatorEpoch::new(1), 22).unwrap(),
@@ -468,7 +577,7 @@ fn typed_recovery_claims_nonterminal_and_preserves_tombstones_after_reopen() {
     assert!(matches!(
         s.recovery_work().unwrap().as_slice(),
         [RecoveryWork::TombstoneDagBinding {
-            terminal: cairn_model::sqlite_store::TombstoneTerminal::Published,
+            terminal: cairn_catalog::sqlite_catalog::TombstoneTerminal::Published,
             ..
         }]
     ));
@@ -481,12 +590,12 @@ fn typed_epoch_and_fence_outcomes_are_explicit_and_authz_is_rechecked() {
     assert_eq!(
         s.claim_coordinator_epoch(CoordinatorEpoch::ZERO, CoordinatorEpoch::new(3))
             .unwrap(),
-        cairn_model::sqlite_store::EpochClaim::Claimed(CoordinatorEpoch::new(3))
+        cairn_catalog::sqlite_catalog::EpochClaim::Claimed(CoordinatorEpoch::new(3))
     );
     assert_eq!(
         s.claim_coordinator_epoch(CoordinatorEpoch::new(3), CoordinatorEpoch::new(2))
             .unwrap(),
-        cairn_model::sqlite_store::EpochClaim::Stale {
+        cairn_catalog::sqlite_catalog::EpochClaim::Stale {
             current: CoordinatorEpoch::new(3)
         }
     );

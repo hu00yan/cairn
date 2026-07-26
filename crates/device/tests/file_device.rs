@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_device::{BlockDevice, DeviceError, FileDevice, IoOperation};
+use cairn_device::io::{BlockDevice, DeviceError, FileDevice, IoOperation};
 
 fn test_path(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);

@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-use crate::{BlockDevice, DeviceError, IoOperation};
+use crate::io::{BlockDevice, DeviceError, IoOperation};
 
 /// A fixed-capacity, position-independent file-backed block device.
 #[derive(Debug)]
