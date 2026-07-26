@@ -62,6 +62,79 @@ The layers have strict ownership:
 | Media selection and physical offsets | media/placement layer | virtual file view |
 | Byte correctness and Snapshot identity | DAG store | access policy |
 
+### 2.1 Native user seam (draft under review)
+
+The first user-facing seam is a small native library, not a filesystem or an
+object-store compatibility layer. A logical File is a named versioned byte
+stream; Collection and File names belong to the catalog, while all byte
+identity and version contents belong to the DAG. No bucket, object, POSIX
+directory, inode, rename, or mmap semantics are implied by this seam.
+
+The intended shape is:
+
+```text
+Store::open(config) -> Store
+Store::create_file(collection, name, operation_id) -> FileId
+Store::head(file) -> Head
+Store::open_snapshot(file, version) -> SnapshotHandle
+SnapshotHandle::len() -> u64
+SnapshotHandle::read_range(range, output) -> bytes_read
+Store::begin_write(file, expected_head, operation_id) -> WriteTxn
+WriteTxn::write_range(range, bounded_stream)
+WriteTxn::truncate(new_size)
+WriteTxn::commit() -> Version
+WriteTxn::abort()
+Store::list_versions(file) -> VersionList
+Store::query_operation(operation_id) -> OperationResult
+```
+
+This is a draft seam, not yet an implementation contract. Before it can be
+frozen, the following rules must be executable in the model and in the real
+adapter:
+
+- `Store::open` completes startup recovery before returning a usable Store, or
+  returns an error and remains unusable; there is no public half-recovered
+  state and no user-triggered `recover()` transition;
+- `SnapshotHandle` binds one immutable Snapshot and never follows a moving
+  head. Reads are bounded, range-based, and stream into caller-provided
+  storage; they do not require a file-sized allocation;
+- `WriteTxn` has one fixed expected head. A stale head fails with
+  `HeadConflict`; phase one has no implicit merge or last-writer-wins rule;
+- `write_range` accepts one bounded stream for one half-open range. Ranges in a
+  transaction are sorted and non-overlapping; overlap is an error. A write
+  beyond EOF creates canonical zero-fill in the gap. Empty writes are no-ops;
+- `truncate` may only reduce the logical size. Extension is represented by a
+  range write or an explicit future operation, so zero-fill semantics are not
+  hidden inside a broad `set_len` operation;
+- a durable DAG Commit is immutable. Catalog publication may later succeed or
+  abort, but it never rolls the Commit back. An uncertain commit is resolved
+  by the stable operation ID, never by replaying the transaction;
+- recovery is an internal startup coordinator. Garbage collection is an
+  administrator-triggered control-plane action, not a user File operation;
+- `SnapshotId`, `CommitId`, DAG cursors, operation bindings, reader leases, and
+  reclamation plans are internal types and do not cross this seam.
+
+The eventual Linux VFS or other adapter, if useful, will be built above this
+seam. It must translate its own semantics into native range reads, immutable
+snapshot reads, and explicit version commits; it must not define the storage
+kernel by forcing POSIX behavior into it.
+
+The reference model may expose internal types to make its executable
+invariants testable, but the production `Store` surface must not re-export
+them. In particular, `FileView` remains an internal coordinator used by
+`SnapshotHandle::read_range`; callers never receive a DAG plan, cursor, lease,
+or authorization token. The Store instance owns the actor/context used for
+authorization, and each range delivery is the linearization unit: authorization
+and lease acquisition happen before that range is delivered, while a later
+range may be rejected after revocation or expiry.
+
+Content addressing is deliberately many-to-one at the binding boundary:
+`operation_id -> at most one CommitId`, while any number of operations and
+logical files may bind the same immutable `CommitId`. Tombstoning one binding
+never tombstones another binding to that Commit. A Commit is reclaimable only
+after all of its active operation bindings and all catalog/history/reader
+roots, including its parent closure, are gone.
+
 SQLite is the phase-one catalog and control-plane database. It is not the
 authoritative copy of file bytes. Every cross-store write first creates a
 durable `publish_intent`; the intent pins its operation and candidate Commit
@@ -333,7 +406,6 @@ are:
 
 ```text
 principal(id, kind, status, authz_epoch)
-authz_state(singleton_id, epoch)
 membership(subject_principal_id, organization_id, capability, status)
 collection(id, principal_id, name, status, unique(principal_id, name))
 file(id, collection_id, name, status, unique(collection_id, name))
@@ -353,7 +425,8 @@ download_grant(id, token_hash, version_id, publication_id, publication_mode,
 download_session(id, grant_id, session_secret_hash, expires_at,
                  closed_at, UNIQUE(grant_id))
 destroy_intent(operation_id, file_id, actor_id, authz_epoch, state, created_at, owner_fence)
-operation_result(operation_id, kind, state, result_id, created_at)
+operation_result(operation_id, actor_id, kind, request_fingerprint, state,
+                 result_id, terminal_error, created_at)
 ```
 
 The schema contract is part of the interface, not an application convention:
@@ -362,14 +435,14 @@ The schema contract is part of the interface, not an application convention:
   nullable columns are listed explicitly below;
 - all primary keys are stable opaque IDs; `operation_id`, `token_hash`, and
   `session_secret_hash` are unique;
-- `authz_state` has exactly one row. Every membership/capability mutation is
-  committed in SQLite while incrementing its monotonic `epoch`; the same
-  transaction updates any affected Principal `authz_epoch`. The epoch is the
-  authoritative authorization fence, not a value supplied by the caller.
+- Every membership/capability mutation is committed in SQLite while incrementing
+  the affected Principal `authz_epoch`. This actor-scoped epoch is the
+  authoritative authorization fence; unrelated organizations do not invalidate
+  an in-flight publish.
 - `membership` records organization membership and capability state. Resource
   ownership is derived from the collection's Principal. A final publish or
   recovery transaction checks the stored actor, ownership, capability, active
-  Principal, and `authz_state.epoch = publish_intent.authz_epoch` in SQLite.
+  Principal, and `Principal.authz_epoch = publish_intent.authz_epoch` in SQLite.
 - `file_version` has `UNIQUE(file_id, id)`; `file_head` references that
   composite key, and `parent_version_id` references the same File through
   `FOREIGN KEY(file_id, parent_version_id)`;
@@ -409,6 +482,8 @@ The schema contract is part of the interface, not an application convention:
 - `download_session.closed_at` is NULL only while the session is open;
 - `principal.kind` is exactly `USER` or `ORGANIZATION`, and
   `principal.status` is exactly `ACTIVE` or `DISABLED`;
+- system management uses an opaque crate-private, process-local authority. It
+  is not a Principal, is not serialized, and never creates a `principal` row;
 - `collection.status` is exactly `ACTIVE` or `DESTROYED`;
 - `publication.mode` is exactly `RESTRICTED` or `PUBLIC`;
 - `publication.expires_at` is NULL for no expiration and `revoked_at` is NULL
@@ -446,8 +521,18 @@ The schema contract is part of the interface, not an application convention:
   pair is unique. `parent_version_id` records catalog provenance; it is not
   inferred from Commit history.
 - `operation_result` is the durable idempotency result for every catalog
-  mutation that accepts an operation_id; terminal results are queryable until
-  the configured audit-retention period ends.
+  mutation that accepts an operation_id. It records the original actor and
+  request fingerprint with the terminal result or sticky terminal error, and
+  terminal results are queryable until the configured audit-retention period
+  ends. A terminal publish/abort retry first authenticates that original actor,
+  matches the fingerprint, and rechecks current active authorization; it then
+  replays this durable result (or the safe terminal public intent view). It
+  never requires a coordinator fence, and a different actor is denied even if
+  it knows the operation ID.
+- `owner_fence` is an in-process, nonterminal coordinator claim only. It is
+  cleared when an intent becomes terminal and is not a recovery or retry
+  contract. Terminal intent reads expose only `PublicPublishIntent`; they do
+  not disclose a candidate receipt, durable-DAG binding, or fence/token.
 
 The catalog has a monotonically increasing schema version. Open fails closed
 if migration is incomplete, foreign keys are off, WAL is unavailable, or the

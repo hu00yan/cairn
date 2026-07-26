@@ -1,17 +1,24 @@
 pub mod catalog;
 pub mod dag;
+pub mod native;
+
+pub use native::{
+    NativeError, OperationTerminal, OperationView, OperationViewResult, SnapshotHandle, Store,
+    StoreConfig, Version, WriteTxn, MAX_RANGE_WRITE_BYTES,
+};
 
 pub use catalog::{
-    Candidate, Capability, CatalogError, Collection, CollectionId, CommitId, CommitReceipt,
-    DagOperationIndexEntry, File, FileId, FileVersion, Generation as CatalogGeneration, Head,
-    IndexState, IntentState, Membership, ModelCatalog, Operation, OperationId, OperationKind,
-    OperationRecord, OperationResult, Principal, PrincipalId, PrincipalKind, PrincipalState,
-    PublishIntent, VersionId,
+    Candidate, Capability, CatalogError, CatalogHandoff, Collection, CollectionId, CommitId,
+    CommitReceipt, DagBindingState, DurableDagReceipt, FenceToken, File, FileId, FileVersion,
+    Generation as CatalogGeneration, Head, IndexState, IntentState, Membership, ModelCatalog,
+    Operation, OperationId, OperationKind, OperationRecord, OperationResult, Principal,
+    PrincipalId, PrincipalKind, PrincipalState, PublicPublishIntent, PublishIntent, VersionId,
 };
 
 pub use dag::{
     content_digest, decode_node, encode_node_payload, node_id, CommitNode, ContentNode, Dag,
-    DagError, Node, NodeId, NodeKind, RangeMapEntry, RangeMapNode, SnapshotNode, ZeroRunNode,
+    DagError, DagOperationBindingState, Node, NodeId, NodeKind, RangeMapEntry, RangeMapNode,
+    SnapshotNode, ZeroRunNode,
 };
 
 use std::collections::HashMap;
