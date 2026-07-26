@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod dag;
 pub mod native;
+pub mod sqlite_store;
 
 pub use native::{
     NativeError, OperationTerminal, OperationView, OperationViewResult, SnapshotHandle, Store,

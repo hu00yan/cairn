@@ -11,3 +11,7 @@ mod file_device;
 
 #[cfg(any(unix, windows))]
 pub use file_device::FileDevice;
+
+mod file_dag;
+
+pub use file_dag::{FileDagStore, FileDagStoreError, RecordKind, RECORD_HEADER_LEN};

@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 serde.workspace = true
 unicode-normalization.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 cairn-core = { path = "../core" }
