@@ -1,6 +1,10 @@
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use blake3::Hasher;
+use cairn_model::dag::MAX_SNAPSHOT_EXTENTS;
 use cairn_model::{
     decode_node, encode_node_payload, CommitId, DagError, Node, NodeId, NodeKind, OperationId,
 };
@@ -83,6 +87,7 @@ pub struct FileDagStore<D> {
     next_offset: u64,
     nodes: HashMap<NodeId, u64>,
     bindings: HashMap<u64, (CommitId, u64)>,
+    validated_snapshots: HashSet<NodeId>,
 }
 
 impl<D: BlockDevice> FileDagStore<D> {
@@ -92,6 +97,7 @@ impl<D: BlockDevice> FileDagStore<D> {
             device,
             nodes: HashMap::new(),
             bindings: HashMap::new(),
+            validated_snapshots: HashSet::new(),
         };
         store.scan()?;
         Ok(store)
@@ -182,6 +188,7 @@ impl<D: BlockDevice> FileDagStore<D> {
         if length > MAX_SNAPSHOT_READ_BYTES {
             return Err(FileDagStoreError::ResourceLimit("snapshot range length"));
         }
+        self.validate_snapshot_digest(snapshot_id, &snapshot)?;
         let root = self.read_required_node(snapshot.range_map_root)?;
         let Node::RangeMap(root) = root else {
             return Err(FileDagStoreError::InvalidReference(snapshot.range_map_root));
@@ -189,14 +196,15 @@ impl<D: BlockDevice> FileDagStore<D> {
         validate_map_root(&root, snapshot.logical_size)?;
 
         let mut output = vec![0; length];
+        let mut budget = ReadBudget::default();
         if length != 0 {
             self.read_map_range(
                 root,
                 snapshot.logical_size,
-                0,
-                snapshot.logical_size,
+                0..snapshot.logical_size,
                 range,
                 &mut output,
+                &mut budget,
             )?;
         }
         Ok(output)
@@ -409,17 +417,24 @@ impl<D: BlockDevice> FileDagStore<D> {
         &mut self,
         map: cairn_model::RangeMapNode,
         logical_size: u64,
-        expected_start: u64,
-        expected_end: u64,
+        expected: Range<u64>,
         requested: Range<u64>,
         output: &mut [u8],
+        budget: &mut ReadBudget,
     ) -> Result<(), FileDagStoreError> {
+        budget.map_nodes = budget
+            .map_nodes
+            .checked_add(1)
+            .ok_or(FileDagStoreError::ResourceLimit("range-map nodes"))?;
+        if budget.map_nodes > MAX_SNAPSHOT_EXTENTS {
+            return Err(FileDagStoreError::ResourceLimit("range-map nodes"));
+        }
         let span = map_span_for_read(&map)?;
         let map_end = span
             .0
             .checked_add(span.1)
             .ok_or(FileDagStoreError::InvalidSnapshot("map span overflow"))?;
-        if span != (expected_start, expected_end - expected_start) || map_end > logical_size {
+        if span != (expected.start, expected.end - expected.start) || map_end > logical_size {
             return Err(FileDagStoreError::InvalidSnapshot("map span is invalid"));
         }
 
@@ -457,13 +472,20 @@ impl<D: BlockDevice> FileDagStore<D> {
                     self.read_map_range(
                         child_map,
                         logical_size,
-                        entry.logical_start,
-                        entry_end,
+                        entry.logical_start..entry_end,
                         start..end,
                         target,
+                        budget,
                     )?;
                 }
                 cairn_model::NodeKind::ZeroRun => {
+                    budget.leaves = budget
+                        .leaves
+                        .checked_add(1)
+                        .ok_or(FileDagStoreError::ResourceLimit("snapshot extents"))?;
+                    if budget.leaves > MAX_SNAPSHOT_EXTENTS {
+                        return Err(FileDagStoreError::ResourceLimit("snapshot extents"));
+                    }
                     if map.level != 0 || entry.content_offset != 0 {
                         return Err(FileDagStoreError::InvalidReference(entry.child));
                     }
@@ -479,6 +501,13 @@ impl<D: BlockDevice> FileDagStore<D> {
                     target.fill(0);
                 }
                 cairn_model::NodeKind::Content => {
+                    budget.leaves = budget
+                        .leaves
+                        .checked_add(1)
+                        .ok_or(FileDagStoreError::ResourceLimit("snapshot extents"))?;
+                    if budget.leaves > MAX_SNAPSHOT_EXTENTS {
+                        return Err(FileDagStoreError::ResourceLimit("snapshot extents"));
+                    }
                     if map.level != 0 {
                         return Err(FileDagStoreError::InvalidReference(entry.child));
                     }
@@ -528,6 +557,54 @@ impl<D: BlockDevice> FileDagStore<D> {
         output.copy_from_slice(bytes);
         Ok(())
     }
+
+    fn validate_snapshot_digest(
+        &mut self,
+        snapshot_id: NodeId,
+        snapshot: &cairn_model::SnapshotNode,
+    ) -> Result<(), FileDagStoreError> {
+        if self.validated_snapshots.contains(&snapshot_id) {
+            return Ok(());
+        }
+        let root = self.read_required_node(snapshot.range_map_root)?;
+        let Node::RangeMap(root) = root else {
+            return Err(FileDagStoreError::InvalidReference(snapshot.range_map_root));
+        };
+        validate_map_root(&root, snapshot.logical_size)?;
+        let mut hasher = Hasher::new();
+        hasher.update(b"cairn/logical-bytes/v1");
+        let mut budget = ReadBudget::default();
+        let mut offset = 0u64;
+        while offset < snapshot.logical_size {
+            let end = offset
+                .saturating_add(MAX_SNAPSHOT_READ_BYTES as u64)
+                .min(snapshot.logical_size);
+            let mut chunk = vec![0; (end - offset) as usize];
+            self.read_map_range(
+                root.clone(),
+                snapshot.logical_size,
+                0..snapshot.logical_size,
+                offset..end,
+                &mut chunk,
+                &mut budget,
+            )?;
+            hasher.update(&chunk);
+            offset = end;
+        }
+        if *hasher.finalize().as_bytes() != snapshot.content_digest {
+            return Err(FileDagStoreError::InvalidSnapshot(
+                "content digest mismatch",
+            ));
+        }
+        self.validated_snapshots.insert(snapshot_id);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ReadBudget {
+    map_nodes: usize,
+    leaves: usize,
 }
 
 fn map_span_for_read(map: &cairn_model::RangeMapNode) -> Result<(u64, u64), FileDagStoreError> {
@@ -901,6 +978,38 @@ mod tests {
         assert!(matches!(
             store.read_snapshot_range(commit, 0..1),
             Err(FileDagStoreError::InvalidReference(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_range_rejects_a_validly_hashed_snapshot_with_wrong_content_digest() {
+        let (disk, commit, _) = persisted_fixture();
+        let mut store = FileDagStore::open(disk).unwrap();
+        let snapshot_id = match store.node(&commit).unwrap().unwrap() {
+            Node::Commit(commit) => commit.snapshot,
+            _ => unreachable!(),
+        };
+        let original = match store.node(&snapshot_id).unwrap() {
+            Some(Node::Snapshot(snapshot)) => snapshot,
+            _ => unreachable!(),
+        };
+        let snapshot = store
+            .append_node(&Node::Snapshot(SnapshotNode {
+                content_digest: [9; 32],
+                ..original
+            }))
+            .unwrap();
+        let bad_commit = store
+            .append_node(&Node::Commit(CommitNode {
+                snapshot,
+                parent: None,
+            }))
+            .unwrap();
+        assert!(matches!(
+            store.read_snapshot_range(bad_commit, 0..1),
+            Err(FileDagStoreError::InvalidSnapshot(
+                "content digest mismatch"
+            ))
         ));
     }
 }
