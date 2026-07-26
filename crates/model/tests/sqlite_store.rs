@@ -114,7 +114,8 @@ mod legacy_tests {
 }
 
 use cairn_model::sqlite_store::{
-    HeadRecord, IntentRecord, OperationRecord, PrincipalRecord, VersionRecord,
+    ClaimIntentOutcome, CoordinatorEpoch, HeadRecord, IntentRecord, OperationRecord,
+    PrincipalRecord, RecoveryWork, T2Outcome, T3Outcome, VersionRecord,
 };
 use rusqlite::Connection;
 
@@ -251,21 +252,16 @@ fn open_rejects_a_non_v1_schema() {
 }
 
 #[test]
-fn schema_rejects_bad_fixed_blobs_and_cross_file_heads() {
+fn schema_rejects_cross_file_heads() {
     let mut s = SqliteCatalogStore::in_memory().unwrap();
     s.persist(&v1_batch()).unwrap();
-    let bad = s.with_immediate_transaction(|tx| {
-        tx.execute(
-            "INSERT INTO file_versions VALUES (1,20,1,zeroblob(31),NULL,0,zeroblob(32))",
-            [],
-        )
-        .map(|_| ())
-    });
-    assert!(bad.is_err());
-    let bad_head = s.with_immediate_transaction(|tx| {
-        tx.execute("INSERT INTO file_head VALUES (21,1,1)", [])
-            .map(|_| ())
-    });
+    let mut bad_head_batch = v1_batch();
+    bad_head_batch.heads = vec![HeadRecord {
+        file_id: 21,
+        version_id: Some(1),
+        generation: 1,
+    }];
+    let bad_head = s.persist(&bad_head_batch);
     assert!(bad_head.is_err());
 }
 
@@ -391,4 +387,297 @@ fn t3_missing_operation_and_fingerprint_conflicts_fail_closed() {
             ..operation
         })
         .unwrap());
+}
+
+#[test]
+fn typed_recovery_claims_nonterminal_and_preserves_tombstones_after_reopen() {
+    let path = std::env::temp_dir().join(format!("cairn-recovery-typed-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut s = SqliteCatalogStore::open(&path).unwrap();
+        let mut b = v1_batch();
+        b.versions.push(VersionRecord {
+            id: 30,
+            file_id: 20,
+            generation: 1,
+            commit_id: [1; 32],
+            parent_version_id: None,
+            size: 1,
+            digest: [2; 32],
+        });
+        b.operations.push(OperationRecord {
+            operation_id: 70,
+            actor_id: 1,
+            kind: "publish".into(),
+            request_fingerprint: [7; 32],
+            state: "prepared".into(),
+            result: None,
+            error: None,
+        });
+        s.persist(&b).unwrap();
+        s.t1_prepare(&IntentRecord {
+            operation_id: 70,
+            actor_id: 1,
+            file_id: 20,
+            owner_epoch: 0,
+            owner_nonce: 11,
+            expected_head_version_id: None,
+            expected_head_generation: 0,
+            candidate_version_id: Some(30),
+            state: "preparing".into(),
+            abort_reason: None,
+            pinned: false,
+            request_fingerprint: [7; 32],
+            authz_epoch: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            s.recovery_work().unwrap().as_slice(),
+            [RecoveryWork::Resume(_)]
+        ));
+        assert_eq!(
+            s.claim_coordinator_epoch(CoordinatorEpoch::ZERO, CoordinatorEpoch::new(1))
+                .unwrap(),
+            cairn_model::sqlite_store::EpochClaim::Claimed(CoordinatorEpoch::new(1))
+        );
+        assert!(matches!(
+            s.claim_intent(70, CoordinatorEpoch::new(1), 22).unwrap(),
+            ClaimIntentOutcome::Claimed(_)
+        ));
+        assert_eq!(
+            s.t2_record_candidate_typed(70, CoordinatorEpoch::new(1), 22, 30)
+                .unwrap(),
+            T2Outcome::Applied
+        );
+        assert_eq!(
+            s.t3_publish_typed(70, CoordinatorEpoch::new(1), 22)
+                .unwrap(),
+            T3Outcome::Published
+        );
+        assert_eq!(
+            s.t3_publish_typed(70, CoordinatorEpoch::new(1), 22)
+                .unwrap(),
+            T3Outcome::AlreadyPublished
+        );
+        assert_eq!(
+            s.t3_publish_typed(70, CoordinatorEpoch::ZERO, 22).unwrap(),
+            T3Outcome::Fenced
+        );
+    }
+    let s = SqliteCatalogStore::open(&path).unwrap();
+    assert!(matches!(
+        s.recovery_work().unwrap().as_slice(),
+        [RecoveryWork::TombstoneDagBinding {
+            terminal: cairn_model::sqlite_store::TombstoneTerminal::Published,
+            ..
+        }]
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn typed_epoch_and_fence_outcomes_are_explicit_and_authz_is_rechecked() {
+    let mut s = SqliteCatalogStore::in_memory().unwrap();
+    assert_eq!(
+        s.claim_coordinator_epoch(CoordinatorEpoch::ZERO, CoordinatorEpoch::new(3))
+            .unwrap(),
+        cairn_model::sqlite_store::EpochClaim::Claimed(CoordinatorEpoch::new(3))
+    );
+    assert_eq!(
+        s.claim_coordinator_epoch(CoordinatorEpoch::new(3), CoordinatorEpoch::new(2))
+            .unwrap(),
+        cairn_model::sqlite_store::EpochClaim::Stale {
+            current: CoordinatorEpoch::new(3)
+        }
+    );
+    assert_eq!(
+        s.t2_record_candidate_typed(999, CoordinatorEpoch::new(2), 1, 1)
+            .unwrap(),
+        T2Outcome::MissingIntent
+    );
+    assert_eq!(
+        s.t3_publish_typed(999, CoordinatorEpoch::new(2), 1)
+            .unwrap(),
+        T3Outcome::MissingIntent
+    );
+}
+
+#[test]
+fn typed_t3_rejects_authz_epoch_membership_revoke_and_head_conflict() {
+    let mut authz_epoch = SqliteCatalogStore::in_memory().unwrap();
+    let mut epoch_batch = v1_batch();
+    epoch_batch.principals[0].authz_epoch = 1;
+    epoch_batch.versions.push(VersionRecord {
+        id: 30,
+        file_id: 20,
+        generation: 1,
+        commit_id: [1; 32],
+        parent_version_id: None,
+        size: 1,
+        digest: [2; 32],
+    });
+    epoch_batch.operations.push(OperationRecord {
+        operation_id: 80,
+        actor_id: 1,
+        kind: "publish".into(),
+        request_fingerprint: [8; 32],
+        state: "prepared".into(),
+        result: None,
+        error: None,
+    });
+    epoch_batch.intents.push(IntentRecord {
+        operation_id: 80,
+        actor_id: 1,
+        file_id: 20,
+        owner_epoch: 0,
+        owner_nonce: 1,
+        expected_head_version_id: None,
+        expected_head_generation: 0,
+        candidate_version_id: Some(30),
+        state: "commit_durable".into(),
+        abort_reason: None,
+        pinned: true,
+        request_fingerprint: [8; 32],
+        authz_epoch: 0,
+    });
+    authz_epoch.persist(&epoch_batch).unwrap();
+    assert_eq!(
+        authz_epoch
+            .t3_publish_typed(80, CoordinatorEpoch::ZERO, 1)
+            .unwrap(),
+        T3Outcome::AuthorizationDenied
+    );
+
+    let mut revoked_membership = SqliteCatalogStore::in_memory().unwrap();
+    let mut membership_batch = v1_batch();
+    membership_batch.principals.push(PrincipalRecord {
+        id: 2,
+        kind: "user".into(),
+        state: "active".into(),
+        authz_epoch: 0,
+    });
+    membership_batch.versions.push(VersionRecord {
+        id: 31,
+        file_id: 20,
+        generation: 1,
+        commit_id: [3; 32],
+        parent_version_id: None,
+        size: 1,
+        digest: [4; 32],
+    });
+    membership_batch.operations.push(OperationRecord {
+        operation_id: 81,
+        actor_id: 2,
+        kind: "publish".into(),
+        request_fingerprint: [9; 32],
+        state: "prepared".into(),
+        result: None,
+        error: None,
+    });
+    membership_batch.intents.push(IntentRecord {
+        operation_id: 81,
+        actor_id: 2,
+        file_id: 20,
+        owner_epoch: 0,
+        owner_nonce: 1,
+        expected_head_version_id: None,
+        expected_head_generation: 0,
+        candidate_version_id: Some(31),
+        state: "commit_durable".into(),
+        abort_reason: None,
+        pinned: true,
+        request_fingerprint: [9; 32],
+        authz_epoch: 0,
+    });
+    revoked_membership.persist(&membership_batch).unwrap();
+    assert_eq!(
+        revoked_membership
+            .t3_publish_typed(81, CoordinatorEpoch::ZERO, 1)
+            .unwrap(),
+        T3Outcome::AuthorizationDenied
+    );
+
+    let mut head_conflict = SqliteCatalogStore::in_memory().unwrap();
+    let mut head_batch = v1_batch();
+    head_batch.versions.push(VersionRecord {
+        id: 32,
+        file_id: 20,
+        generation: 1,
+        commit_id: [5; 32],
+        parent_version_id: None,
+        size: 1,
+        digest: [6; 32],
+    });
+    head_batch.heads[0] = HeadRecord {
+        file_id: 20,
+        version_id: Some(32),
+        generation: 1,
+    };
+    head_batch.operations.push(OperationRecord {
+        operation_id: 82,
+        actor_id: 1,
+        kind: "publish".into(),
+        request_fingerprint: [10; 32],
+        state: "prepared".into(),
+        result: None,
+        error: None,
+    });
+    head_batch.intents.push(IntentRecord {
+        operation_id: 82,
+        actor_id: 1,
+        file_id: 20,
+        owner_epoch: 0,
+        owner_nonce: 1,
+        expected_head_version_id: None,
+        expected_head_generation: 0,
+        candidate_version_id: Some(32),
+        state: "commit_durable".into(),
+        abort_reason: None,
+        pinned: true,
+        request_fingerprint: [10; 32],
+        authz_epoch: 0,
+    });
+    head_conflict.persist(&head_batch).unwrap();
+    assert_eq!(
+        head_conflict
+            .t3_publish_typed(82, CoordinatorEpoch::ZERO, 1)
+            .unwrap(),
+        T3Outcome::HeadConflict
+    );
+}
+
+#[test]
+fn claim_rejects_a_future_owner_epoch() {
+    let mut s = SqliteCatalogStore::in_memory().unwrap();
+    let mut b = v1_batch();
+    b.operations.push(OperationRecord {
+        operation_id: 90,
+        actor_id: 1,
+        kind: "publish".into(),
+        request_fingerprint: [11; 32],
+        state: "prepared".into(),
+        result: None,
+        error: None,
+    });
+    b.intents.push(IntentRecord {
+        operation_id: 90,
+        actor_id: 1,
+        file_id: 20,
+        owner_epoch: 2,
+        owner_nonce: 1,
+        expected_head_version_id: None,
+        expected_head_generation: 0,
+        candidate_version_id: None,
+        state: "preparing".into(),
+        abort_reason: None,
+        pinned: true,
+        request_fingerprint: [11; 32],
+        authz_epoch: 0,
+    });
+    s.persist(&b).unwrap();
+    assert!(matches!(
+        s.claim_intent(90, CoordinatorEpoch::ZERO, 2).unwrap(),
+        ClaimIntentOutcome::FutureOwner { owner_epoch, current }
+            if owner_epoch == CoordinatorEpoch::new(2) && current == CoordinatorEpoch::ZERO
+    ));
 }

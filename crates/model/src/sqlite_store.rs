@@ -400,6 +400,90 @@ pub struct OperationRecord {
     pub result: Option<String>,
     pub error: Option<String>,
 }
+
+/// A fencing epoch owned by the single-node coordinator.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CoordinatorEpoch(u64);
+
+impl CoordinatorEpoch {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryIntent {
+    Nonterminal(IntentRecord),
+    PublishedTombstone(IntentRecord),
+    AbortedTombstone(IntentRecord),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryWork {
+    Resume(IntentRecord),
+    TombstoneDagBinding {
+        intent: IntentRecord,
+        terminal: TombstoneTerminal,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TombstoneTerminal {
+    Published,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpochClaim {
+    Claimed(CoordinatorEpoch),
+    Stale { current: CoordinatorEpoch },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimIntentOutcome {
+    Claimed(RecoveryIntent),
+    Missing,
+    Fenced {
+        current: CoordinatorEpoch,
+    },
+    AlreadyClaimed {
+        owner_epoch: CoordinatorEpoch,
+        owner_nonce: u64,
+    },
+    FutureOwner {
+        owner_epoch: CoordinatorEpoch,
+        current: CoordinatorEpoch,
+    },
+    Terminal(RecoveryIntent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum T2Outcome {
+    Applied,
+    MissingIntent,
+    Fenced,
+    NotPreparing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum T3Outcome {
+    Published,
+    AlreadyPublished,
+    MissingIntent,
+    MissingOperation,
+    Fenced,
+    NotCommitDurable,
+    AuthorizationDenied,
+    MissingCandidate,
+    VersionConflict,
+    HeadConflict,
+}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CatalogBatch {
     pub principals: Vec<PrincipalRecord>,
@@ -426,8 +510,6 @@ pub struct CatalogCounts {
 pub struct SqliteCatalogStore {
     connection: Connection,
 }
-
-type T3Row = (u64, u64, Option<u64>, u64, Option<u64>, String, String);
 
 fn validate_schema_v1(connection: &Connection) -> rusqlite::Result<()> {
     for statement in SCHEMA_V1.split(';') {
@@ -493,7 +575,7 @@ impl SqliteCatalogStore {
         validate_schema_v1(&connection)?;
         Ok(Self { connection })
     }
-    pub fn with_immediate_transaction<T>(
+    fn with_immediate_transaction<T>(
         &mut self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
@@ -511,12 +593,124 @@ impl SqliteCatalogStore {
             |r| r.get(0),
         )
     }
+    pub fn coordinator_epoch_typed(&self) -> rusqlite::Result<CoordinatorEpoch> {
+        Ok(CoordinatorEpoch::new(self.coordinator_epoch()?))
+    }
+    pub fn claim_coordinator_epoch(
+        &mut self,
+        expected: CoordinatorEpoch,
+        next: CoordinatorEpoch,
+    ) -> rusqlite::Result<EpochClaim> {
+        self.with_immediate_transaction(|tx| {
+            let changed = tx.execute(
+                "UPDATE catalog_meta
+                    SET coordinator_epoch = ?1
+                  WHERE id = 1 AND coordinator_epoch = ?2 AND ?1 > ?2",
+                params![next.get(), expected.get()],
+            )?;
+            if changed == 1 {
+                Ok(EpochClaim::Claimed(next))
+            } else {
+                let current: u64 = tx.query_row(
+                    "SELECT coordinator_epoch FROM catalog_meta WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(EpochClaim::Stale {
+                    current: CoordinatorEpoch::new(current),
+                })
+            }
+        })
+    }
     pub fn cas_owner_epoch(&mut self, expected: u64, next: u64) -> rusqlite::Result<bool> {
         self.with_immediate_transaction(|tx| {
             Ok(tx.execute(
                 "UPDATE catalog_meta SET coordinator_epoch=?1 WHERE id=1 AND coordinator_epoch=?2 AND ?1 > ?2",
                 params![next, expected],
             )? == 1)
+        })
+    }
+    pub fn recovery_work(&self) -> rusqlite::Result<Vec<RecoveryWork>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT operation_id FROM publish_intents ORDER BY operation_id")?;
+        let ids = statement.query_map([], |row| row.get::<_, u64>(0))?;
+        let mut work = Vec::new();
+        for id in ids {
+            let intent =
+                load_intent(&self.connection, id?)?.ok_or(rusqlite::Error::InvalidQuery)?;
+            let classified = classify_intent(intent);
+            work.push(match &classified {
+                RecoveryIntent::Nonterminal(intent) => RecoveryWork::Resume(intent.clone()),
+                RecoveryIntent::PublishedTombstone(intent) => RecoveryWork::TombstoneDagBinding {
+                    intent: intent.clone(),
+                    terminal: TombstoneTerminal::Published,
+                },
+                RecoveryIntent::AbortedTombstone(intent) => RecoveryWork::TombstoneDagBinding {
+                    intent: intent.clone(),
+                    terminal: TombstoneTerminal::Aborted,
+                },
+            });
+        }
+        Ok(work)
+    }
+    pub fn claim_intent(
+        &mut self,
+        operation_id: u64,
+        epoch: CoordinatorEpoch,
+        nonce: u64,
+    ) -> rusqlite::Result<ClaimIntentOutcome> {
+        self.with_immediate_transaction(|tx| {
+            let Some(intent) = load_intent(tx, operation_id)? else {
+                return Ok(ClaimIntentOutcome::Missing);
+            };
+            let current: u64 = tx.query_row(
+                "SELECT coordinator_epoch FROM catalog_meta WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )?;
+            let classified = classify_intent(intent.clone());
+            if matches!(
+                classified,
+                RecoveryIntent::PublishedTombstone(_) | RecoveryIntent::AbortedTombstone(_)
+            ) {
+                return Ok(ClaimIntentOutcome::Terminal(classified));
+            }
+            if current != epoch.get() {
+                return Ok(ClaimIntentOutcome::Fenced {
+                    current: CoordinatorEpoch::new(current),
+                });
+            }
+            if intent.owner_epoch > CoordinatorEpoch::new(current).get() {
+                return Ok(ClaimIntentOutcome::FutureOwner {
+                    owner_epoch: CoordinatorEpoch::new(intent.owner_epoch),
+                    current: CoordinatorEpoch::new(current),
+                });
+            }
+            if intent.owner_epoch == epoch.get() && intent.owner_nonce == nonce {
+                return Ok(ClaimIntentOutcome::Claimed(classified));
+            }
+            if intent.owner_epoch == epoch.get() {
+                return Ok(ClaimIntentOutcome::AlreadyClaimed {
+                    owner_epoch: epoch,
+                    owner_nonce: intent.owner_nonce,
+                });
+            }
+            let changed = tx.execute(
+                "UPDATE publish_intents
+                    SET owner_epoch = ?1, owner_nonce = ?2, pinned = 1
+                  WHERE operation_id = ?3
+                    AND state IN ('preparing','commit_durable')
+                    AND owner_epoch < ?1
+                    AND (SELECT coordinator_epoch FROM catalog_meta WHERE id = 1) = ?1",
+                params![epoch.get(), nonce, operation_id],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(ClaimIntentOutcome::Claimed(RecoveryIntent::Nonterminal(
+                load_intent(tx, operation_id)?.ok_or(rusqlite::Error::InvalidQuery)?,
+            )))
         })
     }
     pub fn persist(&mut self, b: &CatalogBatch) -> rusqlite::Result<()> {
@@ -557,138 +751,58 @@ impl SqliteCatalogStore {
         nonce: u64,
         version: u64,
     ) -> rusqlite::Result<bool> {
-        self.with_immediate_transaction(|tx|Ok(tx.execute("UPDATE publish_intents SET candidate_version_id=?1,state='commit_durable' WHERE operation_id=?2 AND owner_epoch=?3 AND owner_nonce=?4 AND state='preparing' AND (SELECT coordinator_epoch FROM catalog_meta WHERE id=1)=?3",params![version,op,epoch,nonce])?==1))
+        Ok(matches!(
+            self.t2_record_candidate_typed(op, CoordinatorEpoch::new(epoch), nonce, version)?,
+            T2Outcome::Applied
+        ))
+    }
+    pub fn t2_record_candidate_typed(
+        &mut self,
+        op: u64,
+        epoch: CoordinatorEpoch,
+        nonce: u64,
+        version: u64,
+    ) -> rusqlite::Result<T2Outcome> {
+        self.with_immediate_transaction(|tx| {
+            let current: u64 = tx.query_row(
+                "SELECT coordinator_epoch FROM catalog_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let Some(intent) = load_intent(tx, op)? else {
+                return Ok(T2Outcome::MissingIntent);
+            };
+            if current != epoch.get()
+                || intent.owner_epoch != epoch.get()
+                || intent.owner_nonce != nonce
+            {
+                return Ok(T2Outcome::Fenced);
+            }
+            if intent.state != "preparing" {
+                return Ok(T2Outcome::NotPreparing);
+            }
+            tx.execute(
+                "UPDATE publish_intents SET candidate_version_id=?1,state='commit_durable'
+                  WHERE operation_id=?2 AND owner_epoch=?3 AND owner_nonce=?4
+                    AND state='preparing'",
+                params![version, op, epoch.get(), nonce],
+            )?;
+            Ok(T2Outcome::Applied)
+        })
     }
     pub fn t3_publish(&mut self, op: u64, epoch: u64, nonce: u64) -> rusqlite::Result<bool> {
-        self.with_immediate_transaction(|tx| {
-            let row: Option<T3Row> = tx
-                .query_row(
-                    "SELECT i.file_id, i.actor_id, i.candidate_version_id,
-                            i.expected_head_generation, i.expected_head_version_id,
-                            p.state, o.state
-                       FROM publish_intents AS i
-                       JOIN principal AS p ON p.id = i.actor_id
-                       JOIN operation_results AS o
-                         ON o.operation_id = i.operation_id
-                        AND o.actor_id = i.actor_id
-                        AND o.kind = 'publish'
-                        AND o.fingerprint = i.request_fingerprint
-                        AND p.authz_epoch = i.authz_epoch
-                      WHERE i.operation_id = ?1
-                        AND i.owner_epoch = ?2
-                        AND i.owner_nonce = ?3
-                        AND i.state = 'commit_durable'
-                        AND (SELECT coordinator_epoch FROM catalog_meta WHERE id = 1) = ?2",
-                    params![op, epoch, nonce],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((
-                file,
-                actor,
-                candidate,
-                generation,
-                expected,
-                principal_state,
-                operation_state,
-            )) = row
-            else {
-                return Ok(false);
-            };
-            if principal_state != "active"
-                || matches!(operation_state.as_str(), "succeeded" | "failed")
-            {
-                return Ok(false);
-            }
-
-            let authorized: bool = tx.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM collections AS c
-                   JOIN files AS f ON f.collection_id = c.id
-                  WHERE f.id = ?1 AND c.owner_id = ?2
-                 UNION ALL
-                 SELECT 1 FROM files AS f
-                 JOIN collections AS c ON c.id = f.collection_id
-                 JOIN membership AS m ON m.organization_id = c.owner_id
-                                      AND m.member_id = ?2
-                WHERE f.id = ?1 AND m.capability IN ('write', 'manage_members')
-                )",
-                params![file, actor],
-                |r| r.get(0),
-            )?;
-            if !authorized {
-                return Ok(false);
-            }
-
-            let Some(candidate) = candidate else {
-                return Ok(false);
-            };
-            let next_generation = generation
-                .checked_add(1)
-                .ok_or(rusqlite::Error::InvalidQuery)?;
-            let valid_version: bool = tx.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM file_versions
-                  WHERE id = ?1 AND file_id = ?2 AND generation = ?3
-                    AND parent_version_id IS ?4
-                )",
-                params![candidate, file, next_generation, expected],
-                |r| r.get(0),
-            )?;
-            if !valid_version {
-                return Ok(false);
-            }
-            let head_matches: bool = tx.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM file_head
-                  WHERE file_id = ?1 AND generation = ?2 AND version_id IS ?3
-                )",
-                params![file, generation, expected],
-                |r| r.get(0),
-            )?;
-            if !head_matches {
-                return Ok(false);
-            }
-
-            let changed = tx.execute(
-                "UPDATE file_head
-                    SET version_id = ?1, generation = ?2
-                  WHERE file_id = ?3 AND generation = ?4 AND version_id IS ?5",
-                params![candidate, next_generation, file, generation, expected],
-            )?;
-            if changed != 1 {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            if tx.execute(
-                "UPDATE publish_intents SET state = 'published', pinned = 0
-                  WHERE operation_id = ?1 AND state = 'commit_durable'",
-                [op],
-            )? != 1
-            {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            if tx.execute(
-                "UPDATE operation_results
-                    SET state = 'succeeded', result = ?1, error = NULL
-                  WHERE operation_id = ?2 AND actor_id = ?3
-                    AND kind = 'publish' AND state NOT IN ('succeeded', 'failed')",
-                params![format!("version:{candidate}"), op, actor],
-            )? != 1
-            {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            Ok(true)
-        })
+        Ok(matches!(
+            self.t3_publish_typed(op, CoordinatorEpoch::new(epoch), nonce)?,
+            T3Outcome::Published
+        ))
+    }
+    pub fn t3_publish_typed(
+        &mut self,
+        op: u64,
+        epoch: CoordinatorEpoch,
+        nonce: u64,
+    ) -> rusqlite::Result<T3Outcome> {
+        self.with_immediate_transaction(|tx| t3_publish_in_transaction(tx, epoch, op, nonce))
     }
     pub fn abort(
         &mut self,
@@ -754,9 +868,183 @@ impl SqliteCatalogStore {
         self.connection.query_row("SELECT actor_id,kind,fingerprint,state,result,error FROM operation_results WHERE operation_id=?1",[op],|r|{let f:Vec<u8>=r.get(2)?;Ok(OperationRecord{operation_id:op,actor_id:r.get(0)?,kind:r.get(1)?,request_fingerprint:f.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,state:r.get(3)?,result:r.get(4)?,error:r.get(5)?})}).optional()
     }
 }
+
+fn t3_publish_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    epoch: CoordinatorEpoch,
+    op: u64,
+    nonce: u64,
+) -> rusqlite::Result<T3Outcome> {
+    let Some(intent) = load_intent(tx, op)? else {
+        return Ok(T3Outcome::MissingIntent);
+    };
+    let current: u64 = tx.query_row(
+        "SELECT coordinator_epoch FROM catalog_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if current != epoch.get() || intent.owner_epoch != epoch.get() || intent.owner_nonce != nonce {
+        return Ok(T3Outcome::Fenced);
+    }
+    if intent.state == "published" {
+        return Ok(T3Outcome::AlreadyPublished);
+    }
+    if intent.state != "commit_durable" {
+        return Ok(T3Outcome::NotCommitDurable);
+    }
+    let operation_ready: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM operation_results
+              WHERE operation_id=?1 AND actor_id=?2 AND kind='publish'
+                AND fingerprint=?3 AND state NOT IN ('succeeded','failed')
+        )",
+        params![op, intent.actor_id, intent.request_fingerprint.as_slice()],
+        |r| r.get(0),
+    )?;
+    if !operation_ready {
+        return Ok(T3Outcome::MissingOperation);
+    }
+    let principal_active: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM principal
+              WHERE id=?1 AND state='active' AND authz_epoch=?2
+        )",
+        params![intent.actor_id, intent.authz_epoch],
+        |r| r.get(0),
+    )?;
+    if !principal_active {
+        return Ok(T3Outcome::AuthorizationDenied);
+    }
+    let authorized: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM collections AS c
+             JOIN files AS f ON f.collection_id=c.id
+            WHERE f.id=?1 AND c.owner_id=?2
+           UNION ALL
+           SELECT 1 FROM collections AS c
+             JOIN files AS f ON f.collection_id=c.id
+             JOIN membership AS m ON m.organization_id=c.owner_id
+                                  AND m.member_id=?2
+            WHERE f.id=?1 AND m.capability IN ('write','manage_members')
+        )",
+        params![intent.file_id, intent.actor_id],
+        |r| r.get(0),
+    )?;
+    if !authorized {
+        return Ok(T3Outcome::AuthorizationDenied);
+    }
+    let Some(candidate) = intent.candidate_version_id else {
+        return Ok(T3Outcome::MissingCandidate);
+    };
+    let next_generation = intent
+        .expected_head_generation
+        .checked_add(1)
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let valid_version: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM file_versions
+              WHERE id=?1 AND file_id=?2 AND generation=?3
+                AND parent_version_id IS ?4
+        )",
+        params![
+            candidate,
+            intent.file_id,
+            next_generation,
+            intent.expected_head_version_id
+        ],
+        |r| r.get(0),
+    )?;
+    if !valid_version {
+        return Ok(T3Outcome::VersionConflict);
+    }
+    let head_matches: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM file_head
+              WHERE file_id=?1 AND generation=?2 AND version_id IS ?3
+        )",
+        params![
+            intent.file_id,
+            intent.expected_head_generation,
+            intent.expected_head_version_id
+        ],
+        |r| r.get(0),
+    )?;
+    if !head_matches {
+        return Ok(T3Outcome::HeadConflict);
+    }
+    tx.execute(
+        "UPDATE file_head SET version_id=?1,generation=?2
+          WHERE file_id=?3 AND generation=?4 AND version_id IS ?5",
+        params![
+            candidate,
+            next_generation,
+            intent.file_id,
+            intent.expected_head_generation,
+            intent.expected_head_version_id
+        ],
+    )?;
+    tx.execute(
+        "UPDATE publish_intents SET state='published',pinned=0
+          WHERE operation_id=?1 AND state='commit_durable'",
+        [op],
+    )?;
+    tx.execute(
+        "UPDATE operation_results SET state='succeeded',result=?1,error=NULL
+          WHERE operation_id=?2 AND actor_id=?3 AND kind='publish'
+            AND fingerprint=?4 AND state NOT IN ('succeeded','failed')",
+        params![
+            format!("version:{candidate}"),
+            op,
+            intent.actor_id,
+            intent.request_fingerprint.as_slice()
+        ],
+    )?;
+    Ok(T3Outcome::Published)
+}
+
 fn count_v1(c: &Connection, t: &str) -> rusqlite::Result<u64> {
     c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
 }
+
+fn load_intent(c: &Connection, operation_id: u64) -> rusqlite::Result<Option<IntentRecord>> {
+    c.query_row(
+        "SELECT actor_id,file_id,owner_epoch,owner_nonce,expected_head_version_id,
+                expected_head_generation,candidate_version_id,state,abort_reason,pinned,
+                request_fingerprint,authz_epoch
+           FROM publish_intents WHERE operation_id=?1",
+        [operation_id],
+        |r| {
+            let fingerprint: Vec<u8> = r.get(10)?;
+            Ok(IntentRecord {
+                operation_id,
+                actor_id: r.get(0)?,
+                file_id: r.get(1)?,
+                owner_epoch: r.get(2)?,
+                owner_nonce: r.get(3)?,
+                expected_head_version_id: r.get(4)?,
+                expected_head_generation: r.get(5)?,
+                candidate_version_id: r.get(6)?,
+                state: r.get(7)?,
+                abort_reason: r.get(8)?,
+                pinned: r.get(9)?,
+                request_fingerprint: fingerprint
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                authz_epoch: r.get(11)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn classify_intent(intent: IntentRecord) -> RecoveryIntent {
+    match intent.state.as_str() {
+        "published" => RecoveryIntent::PublishedTombstone(intent),
+        "aborted" => RecoveryIntent::AbortedTombstone(intent),
+        _ => RecoveryIntent::Nonterminal(intent),
+    }
+}
+
 fn cut_v1(a: CrashPoint, e: CrashPoint) -> rusqlite::Result<()> {
     if a == e {
         Err(rusqlite::Error::InvalidParameterName(format!("cut {e:?}")))
