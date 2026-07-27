@@ -551,6 +551,31 @@ pub struct CatalogCounts {
 #[derive(Debug)]
 pub struct SqliteCatalogStore {
     connection: Connection,
+    committed_transactions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogDurabilityMetrics {
+    pub committed_transactions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalCheckpointMode {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
+impl WalCheckpointMode {
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Full => "FULL",
+            Self::Restart => "RESTART",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
 }
 
 fn validate_schema_v3(connection: &Connection) -> rusqlite::Result<()> {
@@ -657,7 +682,10 @@ impl SqliteCatalogStore {
             return Err(rusqlite::Error::InvalidQuery);
         }
         validate_schema_v3(&connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            committed_transactions: 0,
+        })
     }
     fn with_immediate_transaction<T>(
         &mut self,
@@ -668,6 +696,7 @@ impl SqliteCatalogStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
+        self.committed_transactions = self.committed_transactions.saturating_add(1);
         Ok(value)
     }
 
@@ -718,10 +747,14 @@ impl SqliteCatalogStore {
                 [file_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
+            let valid_head = match head.0 {
+                None => head.1 == 0,
+                Some(_) => head.1 > 0,
+            };
             if principal != ("user".into(), "active".into(), 0)
                 || collection != (principal_id, collection_name.to_owned())
                 || file != (collection_id, file_name.to_owned())
-                || head != (None, 0)
+                || !valid_head
             {
                 return Err(rusqlite::Error::InvalidQuery);
             }
@@ -1203,7 +1236,9 @@ impl SqliteCatalogStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_v1(&tx, b, cut)?;
-        tx.commit()
+        tx.commit()?;
+        self.committed_transactions = self.committed_transactions.saturating_add(1);
+        Ok(())
     }
     pub fn t1_prepare(&mut self, i: &IntentRecord) -> rusqlite::Result<()> {
         self.with_immediate_transaction(|tx| {
@@ -1489,6 +1524,18 @@ impl SqliteCatalogStore {
                 .query_row::<i64, _, _>("PRAGMA synchronous", [], |r| r.get(0))?
                 .to_string(),
         ))
+    }
+    pub fn durability_metrics(&self) -> CatalogDurabilityMetrics {
+        CatalogDurabilityMetrics {
+            committed_transactions: self.committed_transactions,
+        }
+    }
+    pub fn checkpoint_wal(&self, mode: WalCheckpointMode) -> rusqlite::Result<(i64, i64, i64)> {
+        self.connection.query_row(
+            &format!("PRAGMA wal_checkpoint({})", mode.as_sql()),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
     }
     pub fn operation(&self, op: u64) -> rusqlite::Result<Option<OperationRecord>> {
         self.connection.query_row("SELECT actor_id,kind,fingerprint,state,result,error FROM operation_results WHERE operation_id=?1",[op],|r|{let f:Vec<u8>=r.get(2)?;Ok(OperationRecord{operation_id:op,actor_id:r.get(0)?,kind:r.get(1)?,request_fingerprint:f.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,state:r.get(3)?,result:r.get(4)?,error:r.get(5)?})}).optional()

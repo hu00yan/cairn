@@ -204,6 +204,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod http;
+pub use http::HttpNode;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SingleNodeConfig {
     pub catalog_path: PathBuf,
@@ -402,7 +405,7 @@ impl SingleNodeStore {
             let intent = match work {
                 RecoveryWork::TombstoneDagBinding { intent, .. } => {
                     let operation_id = OperationId::from_raw(intent.operation_id);
-                    if let Some(commit_id) = dag.operation_binding(operation_id) {
+                    if let Some(commit_id) = dag.operation_binding(operation_id).map_err(map_dag)? {
                         dag.tombstone_operation(operation_id, commit_id)
                             .map_err(map_dag)?;
                     }
@@ -439,6 +442,7 @@ impl SingleNodeStore {
                 let operation_id = OperationId::from_raw(intent.operation_id);
                 let commit_id = dag
                     .operation_binding(operation_id)
+                    .map_err(map_dag)?
                     .ok_or(SingleNodeError::DagUnavailable)?;
                 if commit_id != version.commit_id {
                     abort_recovery(
@@ -497,26 +501,9 @@ impl SingleNodeStore {
                         "recovery_publish_failed",
                     )?,
                 }
-            } else if intent.state == "preparing"
-                && intent.candidate_version_id.is_none()
-                && dag
-                    .operation_binding(OperationId::from_raw(intent.operation_id))
-                    .is_none()
-            {
-                let aborted = catalog
-                    .abort(
-                        intent.operation_id,
-                        coordinator_epoch,
-                        intent.owner_nonce,
-                        "recovery_without_dag_binding",
-                    )
-                    .map_err(|_| SingleNodeError::CatalogUnavailable)?;
-                if !aborted {
-                    return Err(SingleNodeError::CatalogUnavailable);
-                }
             } else if intent.state == "preparing" && intent.candidate_version_id.is_none() {
                 let operation_id = OperationId::from_raw(intent.operation_id);
-                if let Some(commit_id) = dag.operation_binding(operation_id) {
+                if let Some(commit_id) = dag.operation_binding(operation_id).map_err(map_dag)? {
                     let verified = match dag.verified_snapshot(commit_id) {
                         Ok(verified) => verified,
                         Err(_) => {
@@ -581,6 +568,18 @@ impl SingleNodeStore {
                             Some(commit_id),
                             "recovery_publish_failed",
                         )?,
+                    }
+                } else {
+                    let aborted = catalog
+                        .abort(
+                            intent.operation_id,
+                            coordinator_epoch,
+                            intent.owner_nonce,
+                            "recovery_without_dag_binding",
+                        )
+                        .map_err(|_| SingleNodeError::CatalogUnavailable)?;
+                    if !aborted {
+                        return Err(SingleNodeError::CatalogUnavailable);
                     }
                 }
             }
@@ -707,14 +706,16 @@ impl SingleNodeStore {
         };
         let mut report = ReclaimReport::default();
         let mut dag = self.dag.lock().map_err(|_| SingleNodeError::Poisoned)?;
-        for operation_id in ids {
-            let operation_id = OperationId::from_raw(operation_id);
-            if let Some(commit_id) = dag.operation_binding(operation_id) {
-                dag.tombstone_operation(operation_id, commit_id)
-                    .map_err(map_dag)?;
-                report.tombstoned_handoffs += 1;
+        let mut operations = Vec::new();
+        for raw_operation_id in ids {
+            let operation_id = OperationId::from_raw(raw_operation_id);
+            if let Some(commit_id) = dag.operation_binding(operation_id).map_err(map_dag)? {
+                operations.push((operation_id, commit_id));
             }
         }
+        dag.tombstone_operation_batch(&operations)
+            .map_err(map_dag)?;
+        report.tombstoned_handoffs = operations.len() as u64;
         Ok(report)
     }
 
@@ -965,30 +966,32 @@ impl SnapshotHandle {
         self.info.len == 0
     }
     pub fn read_range(&self, range: Range<u64>) -> Result<Vec<u8>, SingleNodeError> {
-        let catalog = self.catalog.lock().map_err(|_| SingleNodeError::Poisoned)?;
-        match catalog
-            .read_authorization(self.actor_id, self.file_id, self.version_id)
-            .map_err(|_| SingleNodeError::CatalogUnavailable)?
-        {
-            ReadAuthorization::Authorized => {}
-            ReadAuthorization::Missing => return Err(SingleNodeError::NoVersion),
-            ReadAuthorization::Unauthorized => return Err(SingleNodeError::Unauthorized),
-            ReadAuthorization::NotPublished => return Err(SingleNodeError::NotPublished),
-        }
-        if !catalog
-            .reader_lease_active(
-                self.lease_id,
-                self.actor_id,
-                self.file_id,
-                self.version_id,
-                self.coordinator_epoch,
-            )
-            .map_err(|_| SingleNodeError::CatalogUnavailable)?
-        {
-            return Err(SingleNodeError::Unavailable);
-        }
         if range.start > range.end || range.end > self.info.len {
             return Err(SingleNodeError::OutOfBounds);
+        }
+        {
+            let catalog = self.catalog.lock().map_err(|_| SingleNodeError::Poisoned)?;
+            match catalog
+                .read_authorization(self.actor_id, self.file_id, self.version_id)
+                .map_err(|_| SingleNodeError::CatalogUnavailable)?
+            {
+                ReadAuthorization::Authorized => {}
+                ReadAuthorization::Missing => return Err(SingleNodeError::NoVersion),
+                ReadAuthorization::Unauthorized => return Err(SingleNodeError::Unauthorized),
+                ReadAuthorization::NotPublished => return Err(SingleNodeError::NotPublished),
+            }
+            if !catalog
+                .reader_lease_active(
+                    self.lease_id,
+                    self.actor_id,
+                    self.file_id,
+                    self.version_id,
+                    self.coordinator_epoch,
+                )
+                .map_err(|_| SingleNodeError::CatalogUnavailable)?
+            {
+                return Err(SingleNodeError::Unavailable);
+            }
         }
         let mut dag = self.dag.lock().map_err(|_| SingleNodeError::Poisoned)?;
         dag.read_snapshot_range(self.commit_id, range)
@@ -1221,6 +1224,7 @@ mod tests {
             .lock()
             .unwrap()
             .operation_tombstone(OperationId::from_raw(50))
+            .unwrap()
             .is_some());
         cleanup(&catalog_path, &data_path);
     }
@@ -1284,19 +1288,20 @@ mod tests {
             .lock()
             .unwrap()
             .operation_binding(OperationId::from_raw(41))
-            .unwrap();
+            .unwrap()
+            .expect("published operation binding");
         drop(snapshot);
         drop(reopened);
 
         let reopened = SingleNodeStore::open(config.clone()).unwrap();
         let dag = reopened.dag.lock().unwrap();
         assert_eq!(
-            dag.operation_binding(OperationId::from_raw(41)),
+            dag.operation_binding(OperationId::from_raw(41)).unwrap(),
             None,
             "startup tombstones the published operation binding"
         );
         assert_eq!(
-            dag.operation_tombstone(OperationId::from_raw(41)),
+            dag.operation_tombstone(OperationId::from_raw(41)).unwrap(),
             Some(commit_id)
         );
         drop(dag);
@@ -1345,16 +1350,20 @@ mod tests {
                 .dag
                 .lock()
                 .unwrap()
-                .operation_binding(OperationId::from_raw(42)),
+                .operation_binding(OperationId::from_raw(42))
+                .unwrap(),
             Some(commit_id)
         );
         drop(reopened);
 
         let reopened = SingleNodeStore::open(config).unwrap();
         let dag = reopened.dag.lock().unwrap();
-        assert_eq!(dag.operation_binding(OperationId::from_raw(42)), None);
         assert_eq!(
-            dag.operation_tombstone(OperationId::from_raw(42)),
+            dag.operation_binding(OperationId::from_raw(42)).unwrap(),
+            None
+        );
+        assert_eq!(
+            dag.operation_tombstone(OperationId::from_raw(42)).unwrap(),
             Some(commit_id)
         );
         drop(dag);

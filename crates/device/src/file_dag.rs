@@ -63,6 +63,7 @@ pub enum FileDagStoreError {
     RecordTooLarge(usize),
     CapacityExhausted { needed: u64, remaining: u64 },
     OperationConflict(u64),
+    RequiresReopen,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +110,7 @@ pub struct FileDagStore<D> {
     bindings: HashMap<u64, OperationBinding>,
     tombstones: HashMap<u64, CommitId>,
     validated_snapshots: HashSet<NodeId>,
+    requires_reopen: bool,
 }
 
 impl<D: BlockDevice> FileDagStore<D> {
@@ -120,12 +122,20 @@ impl<D: BlockDevice> FileDagStore<D> {
             bindings: HashMap::new(),
             tombstones: HashMap::new(),
             validated_snapshots: HashSet::new(),
+            requires_reopen: false,
         };
         store.scan()?;
         Ok(store)
     }
 
     pub fn append_node(&mut self, node: &Node) -> Result<NodeId, FileDagStoreError> {
+        self.append_node_inner(node, true)
+    }
+
+    fn append_node_inner(&mut self, node: &Node, flush: bool) -> Result<NodeId, FileDagStoreError> {
+        if self.requires_reopen {
+            return Err(FileDagStoreError::RequiresReopen);
+        }
         let payload = encode_node_payload(node)?;
         let id = node.id()?;
         if let Some(&offset) = self.nodes.get(&id) {
@@ -135,7 +145,10 @@ impl<D: BlockDevice> FileDagStore<D> {
             }
             return Ok(id);
         }
-        self.append_record(RecordKind::Node(node.kind()), &payload)?;
+        if let Err(error) = self.append_record(RecordKind::Node(node.kind()), &payload, flush) {
+            self.requires_reopen = true;
+            return Err(error);
+        }
         let offset = self.next_offset - record_size(payload.len()) as u64;
         self.nodes.insert(id, offset);
         Ok(id)
@@ -149,11 +162,58 @@ impl<D: BlockDevice> FileDagStore<D> {
         bytes: &[u8],
         parent: Option<CommitId>,
     ) -> Result<VerifiedSnapshot, FileDagStoreError> {
+        let verified = match self.append_snapshot_unflushed(bytes, parent) {
+            Ok(verified) => verified,
+            Err(error) => {
+                self.requires_reopen = true;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.device.flush_data() {
+            self.requires_reopen = true;
+            return Err(error.into());
+        }
+        Ok(verified)
+    }
+
+    /// Appends several immutable snapshots and shares one data durability
+    /// barrier across the whole batch.
+    pub fn append_snapshot_batch(
+        &mut self,
+        snapshots: &[(&[u8], Option<CommitId>)],
+    ) -> Result<Vec<VerifiedSnapshot>, FileDagStoreError> {
+        let mut verified = Vec::with_capacity(snapshots.len());
+        for (bytes, parent) in snapshots {
+            match self.append_snapshot_unflushed(bytes, *parent) {
+                Ok(snapshot) => verified.push(snapshot),
+                Err(error) => {
+                    self.requires_reopen = true;
+                    return Err(error);
+                }
+            }
+        }
+        if !snapshots.is_empty() {
+            if let Err(error) = self.device.flush_data() {
+                self.requires_reopen = true;
+                return Err(error.into());
+            }
+        }
+        Ok(verified)
+    }
+
+    fn append_snapshot_unflushed(
+        &mut self,
+        bytes: &[u8],
+        parent: Option<CommitId>,
+    ) -> Result<VerifiedSnapshot, FileDagStoreError> {
         let mut children = Vec::new();
         for (index, chunk) in bytes.chunks(MAX_CONTENT_NODE_PAYLOAD).enumerate() {
-            let child = self.append_node(&Node::Content(ContentNode {
-                bytes: chunk.to_vec(),
-            }))?;
+            let child = self.append_node_inner(
+                &Node::Content(ContentNode {
+                    bytes: chunk.to_vec(),
+                }),
+                false,
+            )?;
             children.push(RangeMapEntry {
                 logical_start: (index * MAX_CONTENT_NODE_PAYLOAD) as u64,
                 logical_len: chunk.len() as u64,
@@ -162,14 +222,19 @@ impl<D: BlockDevice> FileDagStore<D> {
                 child,
             });
         }
-        let range_map = self.append_node(&Node::RangeMap(RangeMapNode { level: 0, children }))?;
+        let range_map =
+            self.append_node_inner(&Node::RangeMap(RangeMapNode { level: 0, children }), false)?;
         let digest = content_digest(bytes);
-        let snapshot = self.append_node(&Node::Snapshot(SnapshotNode {
-            logical_size: bytes.len() as u64,
-            range_map_root: range_map,
-            content_digest: digest,
-        }))?;
-        let commit = self.append_node(&Node::Commit(CommitNode { snapshot, parent }))?;
+        let snapshot = self.append_node_inner(
+            &Node::Snapshot(SnapshotNode {
+                logical_size: bytes.len() as u64,
+                range_map_root: range_map,
+                content_digest: digest,
+            }),
+            false,
+        )?;
+        let commit =
+            self.append_node_inner(&Node::Commit(CommitNode { snapshot, parent }), false)?;
         Ok(VerifiedSnapshot {
             commit_id: commit,
             logical_size: bytes.len() as u64,
@@ -182,6 +247,9 @@ impl<D: BlockDevice> FileDagStore<D> {
         operation_id: OperationId,
         commit_id: CommitId,
     ) -> Result<(), FileDagStoreError> {
+        if self.requires_reopen {
+            return Err(FileDagStoreError::RequiresReopen);
+        }
         self.validate_commit(commit_id)?;
         if self.tombstones.contains_key(&operation_id.get()) {
             return Err(FileDagStoreError::OperationConflict(operation_id.get()));
@@ -195,7 +263,10 @@ impl<D: BlockDevice> FileDagStore<D> {
         let mut payload = Vec::with_capacity(40);
         payload.extend_from_slice(&operation_id.get().to_le_bytes());
         payload.extend_from_slice(&commit_id);
-        self.append_record(RecordKind::OperationBinding, &payload)?;
+        if let Err(error) = self.append_record(RecordKind::OperationBinding, &payload, true) {
+            self.requires_reopen = true;
+            return Err(error);
+        }
         self.bindings
             .insert(operation_id.get(), OperationBinding { commit_id });
         Ok(())
@@ -209,28 +280,59 @@ impl<D: BlockDevice> FileDagStore<D> {
         operation_id: OperationId,
         commit_id: CommitId,
     ) -> Result<(), FileDagStoreError> {
-        self.validate_commit(commit_id)?;
-        if let Some(&existing) = self.tombstones.get(&operation_id.get()) {
-            return (existing == commit_id)
-                .then_some(())
-                .ok_or(FileDagStoreError::OperationConflict(operation_id.get()));
+        self.tombstone_operation_batch(&[(operation_id, commit_id)])
+    }
+
+    /// Appends several terminal markers with one data durability barrier.
+    pub fn tombstone_operation_batch(
+        &mut self,
+        operations: &[(OperationId, CommitId)],
+    ) -> Result<(), FileDagStoreError> {
+        if self.requires_reopen {
+            return Err(FileDagStoreError::RequiresReopen);
         }
-        let Some(existing) = self.bindings.get(&operation_id.get()) else {
-            return Err(FileDagStoreError::OperationConflict(operation_id.get()));
-        };
-        if existing.commit_id != commit_id {
-            return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+        let mut pending = Vec::new();
+        for &(operation_id, commit_id) in operations {
+            self.validate_commit(commit_id)?;
+            if let Some(&existing) = self.tombstones.get(&operation_id.get()) {
+                if existing != commit_id {
+                    return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+                }
+                continue;
+            }
+            let Some(existing) = self.bindings.get(&operation_id.get()) else {
+                return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+            };
+            if existing.commit_id != commit_id {
+                return Err(FileDagStoreError::OperationConflict(operation_id.get()));
+            }
+            pending.push((operation_id, commit_id));
         }
-        let mut payload = Vec::with_capacity(40);
-        payload.extend_from_slice(&operation_id.get().to_le_bytes());
-        payload.extend_from_slice(&commit_id);
-        self.append_record(RecordKind::OperationTombstone, &payload)?;
-        self.bindings.remove(&operation_id.get());
-        self.tombstones.insert(operation_id.get(), commit_id);
+        for &(operation_id, commit_id) in &pending {
+            let mut payload = Vec::with_capacity(40);
+            payload.extend_from_slice(&operation_id.get().to_le_bytes());
+            payload.extend_from_slice(&commit_id);
+            if let Err(error) = self.append_record(RecordKind::OperationTombstone, &payload, false)
+            {
+                self.requires_reopen = true;
+                return Err(error);
+            }
+        }
+        if !pending.is_empty() {
+            if let Err(error) = self.device.flush_data() {
+                self.requires_reopen = true;
+                return Err(error.into());
+            }
+        }
+        for &(operation_id, commit_id) in &pending {
+            self.bindings.remove(&operation_id.get());
+            self.tombstones.insert(operation_id.get(), commit_id);
+        }
         Ok(())
     }
 
     pub fn node(&mut self, id: &NodeId) -> Result<Option<Node>, FileDagStoreError> {
+        self.ensure_healthy()?;
         self.nodes
             .get(id)
             .copied()
@@ -249,6 +351,7 @@ impl<D: BlockDevice> FileDagStore<D> {
         commit_id: CommitId,
         range: Range<u64>,
     ) -> Result<Vec<u8>, FileDagStoreError> {
+        self.ensure_healthy()?;
         if range.start > range.end {
             return Err(FileDagStoreError::RangeOutOfBounds {
                 start: range.start,
@@ -303,6 +406,7 @@ impl<D: BlockDevice> FileDagStore<D> {
         &mut self,
         commit_id: CommitId,
     ) -> Result<VerifiedSnapshot, FileDagStoreError> {
+        self.ensure_healthy()?;
         let commit = self.read_required_node(commit_id)?;
         let Node::Commit(commit_node) = commit else {
             return Err(FileDagStoreError::InvalidReference(commit_id));
@@ -320,25 +424,40 @@ impl<D: BlockDevice> FileDagStore<D> {
         })
     }
 
-    pub fn operation_binding(&self, operation_id: OperationId) -> Option<CommitId> {
-        self.bindings
+    pub fn operation_binding(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CommitId>, FileDagStoreError> {
+        self.ensure_healthy()?;
+        Ok(self
+            .bindings
             .get(&operation_id.get())
-            .map(|binding| binding.commit_id)
+            .map(|binding| binding.commit_id))
     }
 
-    pub fn operation_tombstone(&self, operation_id: OperationId) -> Option<CommitId> {
-        self.tombstones.get(&operation_id.get()).copied()
+    pub fn operation_tombstone(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CommitId>, FileDagStoreError> {
+        self.ensure_healthy()?;
+        Ok(self.tombstones.get(&operation_id.get()).copied())
     }
 
-    pub fn next_offset(&self) -> u64 {
-        self.next_offset
+    pub fn next_offset(&self) -> Result<u64, FileDagStoreError> {
+        self.ensure_healthy()?;
+        Ok(self.next_offset)
     }
 
     pub fn into_inner(self) -> D {
         self.device
     }
 
-    fn append_record(&mut self, kind: RecordKind, payload: &[u8]) -> Result<(), FileDagStoreError> {
+    fn append_record(
+        &mut self,
+        kind: RecordKind,
+        payload: &[u8],
+        flush: bool,
+    ) -> Result<(), FileDagStoreError> {
         if payload.len() > MAX_RECORD_PAYLOAD {
             return Err(FileDagStoreError::RecordTooLarge(payload.len()));
         }
@@ -354,20 +473,28 @@ impl<D: BlockDevice> FileDagStore<D> {
         self.device.write_at(self.next_offset, &header)?;
         self.device
             .write_at(self.next_offset + RECORD_HEADER_LEN as u64, payload)?;
-        self.device.flush_data()?;
         let footer = encode_footer(kind, payload);
         self.device.write_at(
             self.next_offset + RECORD_HEADER_LEN as u64 + payload.len() as u64,
             &footer,
         )?;
-        self.device.flush_data()?;
         self.device.write_at(
             self.next_offset + RECORD_HEADER_LEN as u64 + payload.len() as u64,
             &RECORD_FOOTER_MAGIC,
         )?;
-        self.device.flush_data()?;
+        if flush {
+            self.device.flush_data()?;
+        }
         self.next_offset += size;
         Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<(), FileDagStoreError> {
+        if self.requires_reopen {
+            Err(FileDagStoreError::RequiresReopen)
+        } else {
+            Ok(())
+        }
     }
 
     fn scan(&mut self) -> Result<(), FileDagStoreError> {
@@ -876,7 +1003,7 @@ mod tests {
         let disk = store.into_inner();
         let mut reopened = FileDagStore::open(disk).unwrap();
         assert_eq!(reopened.node(&node_id).unwrap(), Some(node));
-        assert_eq!(reopened.operation_binding(operation), Some(commit));
+        assert_eq!(reopened.operation_binding(operation).unwrap(), Some(commit));
     }
 
     #[test]
@@ -904,10 +1031,10 @@ mod tests {
             .unwrap();
         let operation = operation_id();
         store.bind_operation(operation, commit).unwrap();
-        assert_eq!(store.operation_binding(operation), Some(commit));
-        let after_bind = store.next_offset();
+        assert_eq!(store.operation_binding(operation).unwrap(), Some(commit));
+        let after_bind = store.next_offset().unwrap();
         store.bind_operation(operation, commit).unwrap();
-        assert_eq!(store.next_offset(), after_bind);
+        assert_eq!(store.next_offset().unwrap(), after_bind);
 
         let other_commit = store
             .append_node(&Node::Commit(CommitNode {
@@ -921,11 +1048,11 @@ mod tests {
         ));
 
         store.tombstone_operation(operation, commit).unwrap();
-        let after_tombstone = store.next_offset();
-        assert_eq!(store.operation_binding(operation), None);
-        assert_eq!(store.operation_tombstone(operation), Some(commit));
+        let after_tombstone = store.next_offset().unwrap();
+        assert_eq!(store.operation_binding(operation).unwrap(), None);
+        assert_eq!(store.operation_tombstone(operation).unwrap(), Some(commit));
         store.tombstone_operation(operation, commit).unwrap();
-        assert_eq!(store.next_offset(), after_tombstone);
+        assert_eq!(store.next_offset().unwrap(), after_tombstone);
         assert!(matches!(
             store.bind_operation(operation, commit),
             Err(FileDagStoreError::OperationConflict(id)) if id == operation.get()
@@ -933,8 +1060,11 @@ mod tests {
 
         let disk = store.into_inner();
         let reopened = FileDagStore::open(disk).unwrap();
-        assert_eq!(reopened.operation_binding(operation), None);
-        assert_eq!(reopened.operation_tombstone(operation), Some(commit));
+        assert_eq!(reopened.operation_binding(operation).unwrap(), None);
+        assert_eq!(
+            reopened.operation_tombstone(operation).unwrap(),
+            Some(commit)
+        );
     }
 
     #[test]
@@ -1034,7 +1164,7 @@ mod tests {
             payload.as_slice()
         );
 
-        assert_eq!(FileDagStore::open(disk).unwrap().next_offset(), 0);
+        assert_eq!(FileDagStore::open(disk).unwrap().next_offset().unwrap(), 0);
     }
 
     #[test]
@@ -1043,7 +1173,7 @@ mod tests {
             rules: vec![DeviceRule {
                 selector: EventSelector {
                     kind: DeviceEventKind::Write,
-                    occurrence: EventOccurrence::Exact(1),
+                    occurrence: EventOccurrence::Any,
                     range: None,
                 },
                 effect: DeviceEffect::TearAndCrashAfter { durable_prefix: 5 },
@@ -1058,7 +1188,7 @@ mod tests {
         assert!(matches!(error, FileDagStoreError::Device(_)));
         let disk = store.into_inner();
         let reopened = FileDagStore::open(disk).unwrap();
-        assert_eq!(reopened.next_offset(), 0);
+        assert_eq!(reopened.next_offset().unwrap(), 0);
     }
 
     fn persisted_fixture() -> (SimDisk, CommitId, Vec<u8>) {
@@ -1142,6 +1272,62 @@ mod tests {
             reopened.verified_snapshot(verified.commit_id).unwrap(),
             verified
         );
+    }
+
+    #[test]
+    fn append_snapshot_flushes_once_per_dag_record() {
+        let disk = SimDisk::new(32 * 1024);
+        let mut store = FileDagStore::open(disk).unwrap();
+        store.append_snapshot(b"durable write", None).unwrap();
+        let disk = store.into_inner();
+        let flushes = disk
+            .trace()
+            .into_iter()
+            .filter(|event| event.kind == DeviceEventKind::FlushData)
+            .count();
+        assert_eq!(flushes, 1, "one flush for the complete snapshot");
+    }
+
+    #[test]
+    fn append_snapshot_batch_shares_one_durability_barrier() {
+        let disk = SimDisk::new(32 * 1024);
+        let mut store = FileDagStore::open(disk).unwrap();
+        let verified = store
+            .append_snapshot_batch(&[(b"first".as_slice(), None), (b"second".as_slice(), None)])
+            .unwrap();
+        assert_eq!(verified.len(), 2);
+        let disk = store.into_inner();
+        let flushes = disk
+            .trace()
+            .into_iter()
+            .filter(|event| event.kind == DeviceEventKind::FlushData)
+            .count();
+        assert_eq!(flushes, 1);
+    }
+
+    #[test]
+    fn failed_snapshot_barrier_requires_reopen_before_retry() {
+        let script = DeviceScript {
+            rules: vec![DeviceRule {
+                selector: EventSelector {
+                    kind: DeviceEventKind::FlushData,
+                    occurrence: EventOccurrence::Any,
+                    range: None,
+                },
+                effect: DeviceEffect::Fail,
+            }],
+            ..DeviceScript::default()
+        };
+        let disk = SimDisk::from_script(32 * 1024, script).unwrap();
+        let mut store = FileDagStore::open(disk).unwrap();
+        assert!(matches!(
+            store.append_snapshot(b"failed durability", None),
+            Err(FileDagStoreError::Device(_))
+        ));
+        assert!(matches!(
+            store.append_snapshot(b"retry", None),
+            Err(FileDagStoreError::RequiresReopen)
+        ));
     }
 
     #[test]

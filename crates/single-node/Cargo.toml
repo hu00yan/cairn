@@ -10,3 +10,12 @@ blake3.workspace = true
 cairn-device = { path = "../device" }
 cairn-catalog = { path = "../catalog" }
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "storage"
+harness = false
